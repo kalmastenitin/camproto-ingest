@@ -22,9 +22,11 @@ impl RtspClient {
         let port = parsed.port().unwrap_or(554);
         let addr = format!("{}:{}", host, port);
 
-        let stream = TcpStream::connect(&addr).await?;
+        let mut stream = TcpStream::connect(&addr).await?;
 
         println!("connected to {}",addr);
+
+        
         Ok(())
     }
 }
