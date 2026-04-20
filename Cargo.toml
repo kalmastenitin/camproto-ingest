@@ -15,5 +15,6 @@ path = "src/bin/dev.rs"
 tokio  = { version = "1", features = ["full"] }
 bytes  = "1"
 url    = "2"
+md5    = "0.8.0"
 tracing            = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
