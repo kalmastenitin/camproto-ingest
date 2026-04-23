@@ -1,4 +1,6 @@
-use camproto_ingest::rtsp::{RtspClient, RtspConfig};
+use camproto_ingest::{
+    rtsp::{RtspClient, RtspConfig},
+};
 
 #[tokio::main]
 async fn main() {
@@ -7,9 +9,30 @@ async fn main() {
         camera_id: "cam_001".into(),
     };
 
-    let client = RtspClient::new(config);
+    let (client, mut rx) = RtspClient::new(config);
 
-    if let Err(e) = client.run().await {
-        eprintln!("error: {}", e);
+    tokio::spawn(async move {
+        if let Err(e) = client.run().await {
+            eprintln!("ingest error :{}", e);
+        }
+    });
+
+    loop {
+        match rx.recv().await {
+            Ok(frame) => {
+                println!(
+                    "FRAME pts={:.3}s keyframe={} size={}B",
+                    frame.pts as f64 / 1_000_000.0,
+                    frame.is_keyframe,
+                    frame.data.len(),
+                );
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                eprintln!("WARNING: dropped {} frames", n);
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                eprintln!("stream ended")
+            }
+        }
     }
 }
