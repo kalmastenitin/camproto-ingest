@@ -1,5 +1,5 @@
 use crate::frame::{Codec, MediaFrame};
-use crate::rtsp::sdp::{CodecParams, parse_sdp};
+use crate::rtsp::sdp::{CodecParams, SdpInfo, parse_sdp};
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use bytes::{BufMut, BytesMut};
@@ -298,12 +298,12 @@ impl RtspClient {
     async fn rtp_loop(
         stream: &mut TcpStream,
         camera_id: &str,
-        codec: &CodecParams,
+        sdp_info: &SdpInfo,
         tx: &broadcast::Sender<MediaFrame>,
     ) -> Result<(), BoxError> {
         // Pre-allocated reassembly buffer — split().freeze() = zero copy at frame boundary
         let mut fu_buf = BytesMut::with_capacity(256 * 1024);
-        let frame_codec = match codec {
+        let frame_codec = match sdp_info.codec {
             CodecParams::H265 { .. } => Codec::H265,
             CodecParams::H264 { .. } => Codec::H264,
         };
@@ -363,7 +363,7 @@ impl RtspClient {
 
                 if end || marker {
                     let data = fu_buf.split().freeze(); // zero copy
-                    let pts = (timestamp as u64) * 1_000_000 / 90_000;
+                    let pts = (timestamp as u64) * 1_000_000 / sdp_info.clock_rate as u64;
                     let is_keyframe = fu_type == 19 || fu_type == 20;
 
                     let frame = MediaFrame {
@@ -449,6 +449,6 @@ impl RtspClient {
 
         println!("streaming camera_id={}", self.config.camera_id);
 
-        Self::rtp_loop(&mut stream, &self.config.camera_id, &sdp_info.codec, &self.tx).await
+        Self::rtp_loop(&mut stream, &self.config.camera_id, &sdp_info, &self.tx).await
     }
 }
