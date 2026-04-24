@@ -1,4 +1,5 @@
 use crate::frame::{Codec, MediaFrame};
+use crate::rtsp::sdp::{CodecParams, parse_sdp};
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use bytes::{BufMut, BytesMut};
@@ -66,7 +67,6 @@ fn digest_auth(
         username, realm, nonce, uri, resp
     )
 }
-
 
 fn md5_hex(input: &str) -> String {
     format!("{:x}", md5::compute(input.as_bytes()))
@@ -298,11 +298,16 @@ impl RtspClient {
     async fn rtp_loop(
         stream: &mut TcpStream,
         camera_id: &str,
+        codec: &CodecParams,
         tx: &broadcast::Sender<MediaFrame>,
     ) -> Result<(), BoxError> {
         // Pre-allocated reassembly buffer — split().freeze() = zero copy at frame boundary
         let mut fu_buf = BytesMut::with_capacity(256 * 1024);
-
+        let frame_codec = match codec {
+            CodecParams::H265 { .. } => Codec::H265,
+            CodecParams::H264 { .. } => Codec::H264,
+        };
+        
         loop {
             // Interleaved frame: $ channel(1B) length(2B BE) data(N bytes)
             let mut hdr = [0u8; 4];
@@ -314,6 +319,8 @@ impl RtspClient {
 
             let channel = hdr[1];
             let length = u16::from_be_bytes([hdr[2], hdr[3]]) as usize;
+
+            
 
             let mut pkt = vec![0u8; length];
             stream.read_exact(&mut pkt).await?;
@@ -361,7 +368,7 @@ impl RtspClient {
 
                     let frame = MediaFrame {
                         camera_id: camera_id.to_string(),
-                        codec: Codec::H265,
+                        codec: frame_codec.clone(),
                         pts,
                         is_keyframe,
                         data,
@@ -414,14 +421,11 @@ impl RtspClient {
             &password,
         )
         .await?;
+        
+        let sdp_info = parse_sdp(&sdp)?;
 
-        let setup_url = sdp
-            .lines()
-            .find(|l| l.starts_with("a=control:"))
-            .and_then(|l| l.strip_prefix("a=control:"))
-            .ok_or("no control URL in SDP")?
-            .to_string();
-
+        let setup_url = sdp_info.control_url.clone();
+        
         let session = Self::do_setup(
             &mut stream,
             &setup_url,
@@ -445,6 +449,6 @@ impl RtspClient {
 
         println!("streaming camera_id={}", self.config.camera_id);
 
-        Self::rtp_loop(&mut stream, &self.config.camera_id, &self.tx).await
+        Self::rtp_loop(&mut stream, &self.config.camera_id, &sdp_info.codec, &self.tx).await
     }
 }

@@ -1,6 +1,4 @@
-use camproto_ingest::{
-    rtsp::{RtspClient, RtspConfig},
-};
+use camproto_ingest::rtsp::{RtspClient, RtspConfig};
 
 #[tokio::main]
 async fn main() {
