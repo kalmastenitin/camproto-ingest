@@ -1,7 +1,7 @@
 # camproto-ingest — Session Context
 
 Part of the CamProto VMS stack.
-Spec: github.com/yourname/camproto-spec
+Spec: github.com/kalmastenitin/camproto-spec
 
 ## What this repo does
 RTSP client + RTP depacketizer → MediaFrame on tokio::broadcast channel.
