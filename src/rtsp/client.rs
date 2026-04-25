@@ -1,5 +1,5 @@
 use crate::frame::{Codec, MediaFrame};
-use crate::rtsp::sdp::{CodecParams, SdpInfo, parse_sdp};
+use crate::rtsp::sdp::{parse_sdp, CodecParams, SdpInfo};
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use bytes::{BufMut, BytesMut};
@@ -304,7 +304,7 @@ impl RtspClient {
         // Pre-allocated reassembly buffer — split().freeze() = zero copy at frame boundary
         let mut fu_buf = BytesMut::with_capacity(256 * 1024);
         let frame_codec = match &sdp_info.codec {
-            CodecParams::H265 { vps,sps, pps } => Codec::H265 {
+            CodecParams::H265 { vps, sps, pps } => Codec::H265 {
                 vps: vps.clone(),
                 pps: pps.clone(),
                 sps: sps.clone(),
@@ -314,7 +314,7 @@ impl RtspClient {
                 pps: pps.clone(),
             },
         };
-        
+
         loop {
             // Interleaved frame: $ channel(1B) length(2B BE) data(N bytes)
             let mut hdr = [0u8; 4];
@@ -326,8 +326,6 @@ impl RtspClient {
 
             let channel = hdr[1];
             let length = u16::from_be_bytes([hdr[2], hdr[3]]) as usize;
-
-            
 
             let mut pkt = vec![0u8; length];
             stream.read_exact(&mut pkt).await?;
@@ -428,11 +426,11 @@ impl RtspClient {
             &password,
         )
         .await?;
-        
+
         let sdp_info = parse_sdp(&sdp)?;
 
         let setup_url = sdp_info.control_url.clone();
-        
+
         let session = Self::do_setup(
             &mut stream,
             &setup_url,

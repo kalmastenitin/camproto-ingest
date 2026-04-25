@@ -2,15 +2,8 @@ use bytes::Bytes;
 
 #[derive(Clone)]
 pub enum Codec {
-    H265 {
-        vps: Bytes,
-        sps: Bytes,
-        pps: Bytes,
-    },
-    H264 {
-        sps: Bytes,
-        pps: Bytes
-    },
+    H265 { vps: Bytes, sps: Bytes, pps: Bytes },
+    H264 { sps: Bytes, pps: Bytes },
 }
 
 #[derive(Clone)]

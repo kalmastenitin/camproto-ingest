@@ -18,16 +18,12 @@ pub enum CodecParams {
 
 fn parse_fmtp_param(fmtp_line: &str, key: &str) -> Result<Bytes, BoxError> {
     let search = format!("{}=", key);
-    let start  = fmtp_line.find(&search)
+    let start = fmtp_line
+        .find(&search)
         .ok_or_else(|| format!("fmtp: missing {}", key))?
         + search.len();
-    let value  = fmtp_line[start..]
-        .split(';')
-        .next()
-        .unwrap_or("")
-        .trim();
+    let value = fmtp_line[start..].split(';').next().unwrap_or("").trim();
     Ok(Bytes::from(B64.decode(value)?))
-
 }
 
 pub fn parse_sdp(sdp: &str) -> Result<SdpInfo, BoxError> {
@@ -78,14 +74,20 @@ pub fn parse_sdp(sdp: &str) -> Result<SdpInfo, BoxError> {
                 .ok_or("H264: no sprop-parameter-sets")?;
             let mut it = params.split(',');
             let sps = Bytes::from(B64.decode(it.next().unwrap_or("").trim())?);
-            let pps = Bytes::from(B64.decode(
-                it.next().unwrap_or("").trim().split(';').next().unwrap_or("")
-            )?);
+            let pps = Bytes::from(
+                B64.decode(
+                    it.next()
+                        .unwrap_or("")
+                        .trim()
+                        .split(';')
+                        .next()
+                        .unwrap_or(""),
+                )?,
+            );
             CodecParams::H264 { sps, pps }
         }
         other => return Err(format!("unsupported codec: {}", other).into()),
     };
-
 
     let control_url = sdp
         .lines()
