@@ -303,9 +303,16 @@ impl RtspClient {
     ) -> Result<(), BoxError> {
         // Pre-allocated reassembly buffer — split().freeze() = zero copy at frame boundary
         let mut fu_buf = BytesMut::with_capacity(256 * 1024);
-        let frame_codec = match sdp_info.codec {
-            CodecParams::H265 { .. } => Codec::H265,
-            CodecParams::H264 { .. } => Codec::H264,
+        let frame_codec = match &sdp_info.codec {
+            CodecParams::H265 { vps,sps, pps } => Codec::H265 {
+                vps: vps.clone(),
+                pps: pps.clone(),
+                sps: sps.clone(),
+            },
+            CodecParams::H264 { sps, pps } => Codec::H264 {
+                sps: sps.clone(),
+                pps: pps.clone(),
+            },
         };
         
         loop {
