@@ -1,4 +1,5 @@
 use crate::frame::{Codec, MediaFrame};
+use crate::rtp::h264::H264Depackatizer;
 use crate::rtsp::sdp::{parse_sdp, CodecParams, SdpInfo};
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
@@ -314,6 +315,7 @@ impl RtspClient {
                 pps: pps.clone(),
             },
         };
+        let mut h264 = H264Depackatizer::new();
 
         loop {
             // Interleaved frame: $ channel(1B) length(2B BE) data(N bytes)
@@ -344,45 +346,54 @@ impl RtspClient {
             if payload.is_empty() {
                 continue;
             }
-
-            // H.265 NAL type = bits 1-6 of byte 0
-            let nal_type = (payload[0] >> 1) & 0x3F;
-
-            // Type 49 = FU (Fragmentation Unit) — large NAL split across packets
-            if nal_type == 49 && payload.len() >= 3 {
-                let fu_hdr = payload[2];
-                let start = (fu_hdr & 0x80) != 0;
-                let end = (fu_hdr & 0x40) != 0;
-                let fu_type = fu_hdr & 0x3F;
-
-                if start {
-                    fu_buf.clear();
-                    // Reconstruct original 2-byte NAL header:
-                    // keep forbidden+layer bits from PayloadHdr, replace nal_unit_type
-                    fu_buf.put_u8((payload[0] & 0x81) | (fu_type << 1));
-                    fu_buf.put_u8(payload[1]);
-                    fu_buf.put_slice(&payload[3..]);
-                } else {
-                    fu_buf.put_slice(&payload[3..]);
+            let pts = (timestamp as u64) * 1_000_000 / sdp_info.clock_rate as u64;
+            match &frame_codec {
+                Codec::H264 { .. } => {
+                    if let Some(data) = h264.push(payload, marker) {
+                        // let nal_type = payload[0] & 0x1F;
+                        let is_keyframe = data.len() > 4 && (data[4] & 0x1F) == 5;
+                        let _ = tx.send(MediaFrame {
+                            camera_id: camera_id.to_string(),
+                            codec: frame_codec.clone(),
+                            pts,
+                            is_keyframe,
+                            data,
+                        });
+                    }
                 }
 
-                if end || marker {
-                    let data = fu_buf.split().freeze(); // zero copy
-                    let pts = (timestamp as u64) * 1_000_000 / sdp_info.clock_rate as u64;
-                    let is_keyframe = fu_type == 19 || fu_type == 20;
+                Codec::H265 { .. } => {
+                    let nal_type = (payload[0] >> 1) & 0x3F;
+                    if nal_type == 49 && payload.len() >= 3 {
+                        let fu_hdr = payload[2];
+                        let start = (fu_hdr & 0x80) != 0;
+                        let end = (fu_hdr & 0x40) != 0;
+                        let fu_type = fu_hdr & 0x3F;
 
-                    let frame = MediaFrame {
-                        camera_id: camera_id.to_string(),
-                        codec: frame_codec.clone(),
-                        pts,
-                        is_keyframe,
-                        data,
-                    };
+                        if start {
+                            fu_buf.clear();
+                            fu_buf.put_u8((payload[0] & 0x81) | (fu_type << 1));
+                            fu_buf.put_u8(payload[1]);
+                            fu_buf.put_slice(&payload[3..]);
+                        } else {
+                            fu_buf.put_slice(&payload[3..]);
+                        }
 
-                    let _ = tx.send(frame);
+                        if end || marker {
+                            let data = fu_buf.split().freeze();
+                            let is_keyframe = fu_type == 19 || fu_type == 20;
+                            let _ = tx.send(MediaFrame {
+                                camera_id: camera_id.to_string(),
+                                codec: frame_codec.clone(),
+                                pts,
+                                is_keyframe,
+                                data,
+                            });
+                        }
+                    }
+                    // TODO: single NAL (1-47), AP (48)
                 }
             }
-            // TODO: single NAL (type 1-47), AP (type 48)
         }
     }
 
