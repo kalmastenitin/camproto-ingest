@@ -1,3 +1,34 @@
+# camproto-ingest — Session Context
+
+Part of the CamProto VMS stack.
+Spec: github.com/kalmastenitin/camproto-spec
+
+## What this repo does
+RTSP client + RTP depacketizer → MediaFrame on tokio::broadcast channel.
+Foundation for camproto-store (recording) and camproto-egress (streaming).
+
+## Architecture
+```
+Camera RTSP/RTP
+    │
+    ▼
+RtspClient::run()                     src/rtsp/client.rs
+    ├── DESCRIBE → parse_sdp()        src/rtsp/sdp.rs
+    ├── Auth (Basic/Digest)           src/rtsp/auth.rs
+    ├── SETUP + PLAY
+    └── TCP interleaved RTP loop
+            │
+            ▼
+        RtpDepacketizer::push()       src/rtp/depack.rs
+            ├── H264Depacketizer      src/rtp/h264.rs
+            └── H265Depacketizer      src/rtp/h265.rs
+                        │
+                        ▼
+                 MediaFrame            src/frame.rs
+                        │
+                 tokio::broadcast
+```
+
 ## Key Types
 ```rust
 // frame.rs
