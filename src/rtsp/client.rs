@@ -1,6 +1,6 @@
 use crate::frame::{Codec, MediaFrame};
 use crate::rtp::h264::H264Depackatizer;
-use crate::rtsp::sdp::{parse_sdp, CodecParams, SdpInfo};
+use crate::rtsp::sdp::{parse_sdp, CodecParams, SdpInfo, StreamInfo};
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use bytes::{BufMut, BytesMut};
@@ -303,14 +303,14 @@ impl RtspClient {
         session: &str,
         username: &str,
         password: &str,
-        auth_method: &Auth, 
+        auth_method: &Auth,
     ) -> Result<(), BoxError> {
         let mut req = format!(
             "TEARDOWN {} RTSP/1.0\r\nCSeq: {}\r\nSession: {}\r\n",
             url, cseq, session
         );
-        if let Some(auth) = auth_method.header("TEARDOWN", url, username, password){
-            req.push_str(&format!("Authorization: {}\r\n",auth));
+        if let Some(auth) = auth_method.header("TEARDOWN", url, username, password) {
+            req.push_str(&format!("Authorization: {}\r\n", auth));
         }
         req.push_str("\r\n");
         *cseq += 1;
@@ -525,14 +525,28 @@ impl RtspClient {
         )
         .await?;
 
-        let result = self.play_and_stream(
-            &mut stream, &sdp_info, &session, &auth, &username, &password,
-        ).await;
+        let result = self
+            .play_and_stream(
+                &mut stream,
+                &sdp_info,
+                &session,
+                &auth,
+                &username,
+                &password,
+            )
+            .await;
 
         Self::do_teardown(
-            &mut stream, &self.config.url, &mut self.cseq,
-            &session,  &username, &password, &auth,
-            ).await.ok();
+            &mut stream,
+            &self.config.url,
+            &mut self.cseq,
+            &session,
+            &username,
+            &password,
+            &auth,
+        )
+        .await
+        .ok();
 
         result
     }
@@ -540,20 +554,56 @@ impl RtspClient {
     // Extract PLAY + rtp_loop into separate method
     async fn play_and_stream(
         &mut self,
-        stream:   &mut TcpStream,
+        stream: &mut TcpStream,
         sdp_info: &SdpInfo,
-        session:  &str,
-        auth:     &Auth,
+        session: &str,
+        auth: &Auth,
         username: &str,
         password: &str,
     ) -> Result<(), BoxError> {
         Self::do_play(
-            stream, &self.config.url, &mut self.cseq,
-            session, username, password, auth,
-        ).await?;
+            stream,
+            &self.config.url,
+            &mut self.cseq,
+            session,
+            username,
+            password,
+            auth,
+        )
+        .await?;
 
         println!("streaming camera_id={}", self.config.camera_id);
 
         Self::rtp_loop(stream, &self.config.camera_id, sdp_info, &self.tx).await
+    }
+
+    pub async fn probe(&self) -> Result<StreamInfo, BoxError> {
+        let parsed = Url::parse(&self.config.url)?;
+        let host = parsed.host_str().ok_or("missing host")?;
+        let port = parsed.port().unwrap_or(554);
+        let addr = format!("{}:{}", host, port);
+        let username = parsed.username().to_string();
+        let password = parsed.password().unwrap_or("").to_string();
+        let camera_ip = host.to_string();
+
+        let mut stream = Self::connect(&addr).await?;
+        let mut cseq = 1u32;
+
+        Self::do_options(&mut stream, &self.config.url, &mut cseq).await?;
+
+        let (_, sdp) = Self::do_describe(
+            &mut stream,
+            &self.config.url,
+            &mut cseq,
+            &username,
+            &password,
+        )
+        .await?;
+
+        // disconnect immediately — no SETUP, no PLAY
+        drop(stream);
+
+        let sdp_info = parse_sdp(&sdp)?;
+        Ok(sdp_info.to_stream_info(&self.config.camera_id, &camera_ip, &sdp_info.session_name))
     }
 }
