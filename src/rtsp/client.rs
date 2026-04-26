@@ -296,6 +296,29 @@ impl RtspClient {
         }
     }
 
+    async fn do_teardown(
+        stream: &mut TcpStream,
+        url: &str,
+        cseq: &mut u32,
+        session: &str,
+        username: &str,
+        password: &str,
+        auth_method: &Auth, 
+    ) -> Result<(), BoxError> {
+        let mut req = format!(
+            "TEARDOWN {} RTSP/1.0\r\nCSeq: {}\r\nSession: {}\r\n",
+            url, cseq, session
+        );
+        if let Some(auth) = auth_method.header("TEARDOWN", url, username, password){
+            req.push_str(&format!("Authorization: {}\r\n",auth));
+        }
+        req.push_str("\r\n");
+        *cseq += 1;
+        // Best effort — ignore errors (connection may already be dead)
+        let _ = stream.write_all(req.as_bytes()).await;
+        Ok(())
+    }
+
     async fn rtp_loop(
         stream: &mut TcpStream,
         camera_id: &str,
@@ -364,24 +387,15 @@ impl RtspClient {
 
                 Codec::H265 { .. } => {
                     let nal_type = (payload[0] >> 1) & 0x3F;
-                    if nal_type == 49 && payload.len() >= 3 {
-                        let fu_hdr = payload[2];
-                        let start = (fu_hdr & 0x80) != 0;
-                        let end = (fu_hdr & 0x40) != 0;
-                        let fu_type = fu_hdr & 0x3F;
+                    match nal_type {
+                        1..=47 => {
+                            // single nal
+                            let mut out = BytesMut::with_capacity(4 + payload.len());
+                            out.put_u32(payload.len() as u32);
+                            out.put_slice(payload);
 
-                        if start {
-                            fu_buf.clear();
-                            fu_buf.put_u8((payload[0] & 0x81) | (fu_type << 1));
-                            fu_buf.put_u8(payload[1]);
-                            fu_buf.put_slice(&payload[3..]);
-                        } else {
-                            fu_buf.put_slice(&payload[3..]);
-                        }
-
-                        if end || marker {
-                            let data = fu_buf.split().freeze();
-                            let is_keyframe = fu_type == 19 || fu_type == 20;
+                            let data = out.freeze();
+                            let is_keyframe = matches!(nal_type, 19 | 20 | 21);
                             let _ = tx.send(MediaFrame {
                                 camera_id: camera_id.to_string(),
                                 codec: frame_codec.clone(),
@@ -390,8 +404,67 @@ impl RtspClient {
                                 data,
                             });
                         }
+                        48 => {
+                            // AP: 2-byte AP NAL header, then [2B size][NAL] repeated
+                            let mut out = BytesMut::with_capacity(payload.len());
+                            let mut offset = 2; // skip 2 byte AP header
+
+                            while offset + 2 <= payload.len() {
+                                let nal_size =
+                                    u16::from_be_bytes([payload[offset], payload[offset + 1]])
+                                        as usize;
+                                offset += 2;
+
+                                if offset + nal_size > payload.len() {
+                                    break;
+                                }
+
+                                let nal = &payload[offset..offset + nal_size];
+                                out.put_u32(nal.len() as u32);
+                                out.put_slice(nal);
+                                offset += nal_size;
+                            }
+
+                            if !out.is_empty() {
+                                let data = out.freeze();
+                                let _ = tx.send(MediaFrame {
+                                    camera_id: camera_id.to_string(),
+                                    codec: frame_codec.clone(),
+                                    pts,
+                                    is_keyframe: false,
+                                    data,
+                                });
+                            }
+                        }
+                        49 => {
+                            let fu_hdr = payload[2];
+                            let start = (fu_hdr & 0x80) != 0;
+                            let end = (fu_hdr & 0x40) != 0;
+                            let fu_type = fu_hdr & 0x3F;
+
+                            if start {
+                                fu_buf.clear();
+                                fu_buf.put_u8((payload[0] & 0x81) | (fu_type << 1));
+                                fu_buf.put_u8(payload[1]);
+                                fu_buf.put_slice(&payload[3..]);
+                            } else {
+                                fu_buf.put_slice(&payload[3..]);
+                            }
+
+                            if end || marker {
+                                let data = fu_buf.split().freeze();
+                                let is_keyframe = fu_type == 19 || fu_type == 20;
+                                let _ = tx.send(MediaFrame {
+                                    camera_id: camera_id.to_string(),
+                                    codec: frame_codec.clone(),
+                                    pts,
+                                    is_keyframe,
+                                    data,
+                                });
+                            }
+                        }
+                        _ => {}
                     }
-                    // TODO: single NAL (1-47), AP (48)
                 }
             }
         }
@@ -452,19 +525,35 @@ impl RtspClient {
         )
         .await?;
 
+        let result = self.play_and_stream(
+            &mut stream, &sdp_info, &session, &auth, &username, &password,
+        ).await;
+
+        Self::do_teardown(
+            &mut stream, &self.config.url, &mut self.cseq,
+            &session,  &username, &password, &auth,
+            ).await.ok();
+
+        result
+    }
+
+    // Extract PLAY + rtp_loop into separate method
+    async fn play_and_stream(
+        &mut self,
+        stream:   &mut TcpStream,
+        sdp_info: &SdpInfo,
+        session:  &str,
+        auth:     &Auth,
+        username: &str,
+        password: &str,
+    ) -> Result<(), BoxError> {
         Self::do_play(
-            &mut stream,
-            &self.config.url,
-            &mut self.cseq,
-            &session,
-            &username,
-            &password,
-            &auth,
-        )
-        .await?;
+            stream, &self.config.url, &mut self.cseq,
+            session, username, password, auth,
+        ).await?;
 
         println!("streaming camera_id={}", self.config.camera_id);
 
-        Self::rtp_loop(&mut stream, &self.config.camera_id, &sdp_info, &self.tx).await
+        Self::rtp_loop(stream, &self.config.camera_id, sdp_info, &self.tx).await
     }
 }

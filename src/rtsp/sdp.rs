@@ -38,16 +38,17 @@ pub fn parse_sdp(sdp: &str) -> Result<SdpInfo, BoxError> {
         .ok_or("m=video missing payload_type")?;
 
     let rtpmap_prefix = format!("a=rtpmap:{}", payload_type);
-    let rtpmap_line   = sdp
+    let rtpmap_line = sdp
         .lines()
         .find(|l| l.starts_with(&rtpmap_prefix))
         .ok_or("no a=rtpmap in sdp")?;
 
-    let encoding   = rtpmap_line.strip_prefix(&rtpmap_prefix).unwrap();
-    let mut parts  = encoding.split('/');
+    let encoding = rtpmap_line.strip_prefix(&rtpmap_prefix).unwrap();
+    let mut parts = encoding.split('/');
     let codec_name = parts.next().unwrap_or("").trim();
     let clock_rate: u32 = parts.next().unwrap_or("90000").parse()?;
 
+    println!("codec_name: {}",codec_name);
     // ── Check codec name FIRST — before requiring fmtp ──────────────────────
     match codec_name {
         "JPEG" | "MJPEG" => return Err("MJPEG not yet supported".into()),
@@ -57,7 +58,7 @@ pub fn parse_sdp(sdp: &str) -> Result<SdpInfo, BoxError> {
 
     // ── Now safe to require fmtp ─────────────────────────────────────────────
     let fmtp_prefix = format!("a=fmtp:{}", payload_type);
-    let fmtp_line   = sdp
+    let fmtp_line = sdp
         .lines()
         .find(|l| l.starts_with(&fmtp_prefix))
         .ok_or("no a=fmtp present in sdp")?;
@@ -76,9 +77,16 @@ pub fn parse_sdp(sdp: &str) -> Result<SdpInfo, BoxError> {
                 .ok_or("H264: no sprop-parameter-sets")?;
             let mut it = params.split(',');
             let sps = Bytes::from(B64.decode(it.next().unwrap_or("").trim())?);
-            let pps = Bytes::from(B64.decode(
-                it.next().unwrap_or("").trim().split(';').next().unwrap_or("")
-            )?);
+            let pps = Bytes::from(
+                B64.decode(
+                    it.next()
+                        .unwrap_or("")
+                        .trim()
+                        .split(';')
+                        .next()
+                        .unwrap_or(""),
+                )?,
+            );
             CodecParams::H264 { sps, pps }
         }
         _ => unreachable!(), // already handled above
@@ -104,5 +112,11 @@ pub fn parse_sdp(sdp: &str) -> Result<SdpInfo, BoxError> {
         })
         .unwrap_or((0, 0));
 
-    Ok(SdpInfo { codec, control_url, clock_rate, width, height })
+    Ok(SdpInfo {
+        codec,
+        control_url,
+        clock_rate,
+        width,
+        height,
+    })
 }
