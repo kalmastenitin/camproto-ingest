@@ -268,6 +268,34 @@ impl RtspClient {
         Ok(session)
     }
 
+    async fn do_setup_audio(
+        stream: &mut TcpStream,
+        audio_url: &str,
+        cseq: &mut u32,
+        username: &str,
+        password: &str,
+        auth_method: &Auth,
+    ) -> Result<(), BoxError> {
+        let mut req = format!("SETUP {} RTSP/1.0\r\nCSeq: {}\r\n", audio_url, cseq);
+
+        if let Some(auth) = auth_method.header("SETUP", audio_url, username, password) {
+            req.push_str(&format!("Authorization: {}\r\n", auth));
+        };
+
+        req.push_str("Transport: RTP/AVP/TCP;unicast;interleaved=2-3\r\n\r\n");
+
+        *cseq += 1;
+        stream.write_all(req.as_bytes()).await?;
+        let resp = read_response(stream).await?;
+
+        match parse_status(&resp) {
+            Some(200) => {}
+            Some(s) => return Err(format!("SETUP failed: {}", s).into()),
+            None => return Err("SETUP: could not parse status".into()),
+        }
+        Ok(())
+    }
+
     async fn do_play(
         stream: &mut TcpStream,
         url: &str,
@@ -354,106 +382,25 @@ impl RtspClient {
 
             let mut pkt = vec![0u8; length];
             stream.read_exact(&mut pkt).await?;
+            match channel {
+                0 => {
+                    if pkt.len() < 12 {
+                        continue;
+                    } // too short for RTP header
 
-            if channel % 2 != 0 {
-                continue;
-            } // odd = RTCP, skip
-            if pkt.len() < 12 {
-                continue;
-            } // too short for RTP header
+                    let marker = (pkt[1] & 0x80) != 0;
+                    let timestamp = u32::from_be_bytes([pkt[4], pkt[5], pkt[6], pkt[7]]);
+                    let payload = &pkt[12..];
 
-            let marker = (pkt[1] & 0x80) != 0;
-            let timestamp = u32::from_be_bytes([pkt[4], pkt[5], pkt[6], pkt[7]]);
-            let payload = &pkt[12..];
-
-            if payload.is_empty() {
-                continue;
-            }
-            let pts = (timestamp as u64) * 1_000_000 / sdp_info.clock_rate as u64;
-            match &frame_codec {
-                Codec::H264 { .. } => {
-                    if let Some(data) = h264.push(payload, marker) {
-                        // let nal_type = payload[0] & 0x1F;
-                        let is_keyframe = data.len() > 4 && (data[4] & 0x1F) == 5;
-                        let _ = tx.send(MediaFrame {
-                            camera_id: camera_id.to_string(),
-                            codec: frame_codec.clone(),
-                            pts,
-                            is_keyframe,
-                            data,
-                        });
+                    if payload.is_empty() {
+                        continue;
                     }
-                }
-
-                Codec::H265 { .. } => {
-                    let nal_type = (payload[0] >> 1) & 0x3F;
-                    match nal_type {
-                        1..=47 => {
-                            // single nal
-                            let mut out = BytesMut::with_capacity(4 + payload.len());
-                            out.put_u32(payload.len() as u32);
-                            out.put_slice(payload);
-
-                            let data = out.freeze();
-                            let is_keyframe = matches!(nal_type, 19 | 20 | 21);
-                            let _ = tx.send(MediaFrame {
-                                camera_id: camera_id.to_string(),
-                                codec: frame_codec.clone(),
-                                pts,
-                                is_keyframe,
-                                data,
-                            });
-                        }
-                        48 => {
-                            // AP: 2-byte AP NAL header, then [2B size][NAL] repeated
-                            let mut out = BytesMut::with_capacity(payload.len());
-                            let mut offset = 2; // skip 2 byte AP header
-
-                            while offset + 2 <= payload.len() {
-                                let nal_size =
-                                    u16::from_be_bytes([payload[offset], payload[offset + 1]])
-                                        as usize;
-                                offset += 2;
-
-                                if offset + nal_size > payload.len() {
-                                    break;
-                                }
-
-                                let nal = &payload[offset..offset + nal_size];
-                                out.put_u32(nal.len() as u32);
-                                out.put_slice(nal);
-                                offset += nal_size;
-                            }
-
-                            if !out.is_empty() {
-                                let data = out.freeze();
-                                let _ = tx.send(MediaFrame {
-                                    camera_id: camera_id.to_string(),
-                                    codec: frame_codec.clone(),
-                                    pts,
-                                    is_keyframe: false,
-                                    data,
-                                });
-                            }
-                        }
-                        49 => {
-                            let fu_hdr = payload[2];
-                            let start = (fu_hdr & 0x80) != 0;
-                            let end = (fu_hdr & 0x40) != 0;
-                            let fu_type = fu_hdr & 0x3F;
-
-                            if start {
-                                fu_buf.clear();
-                                fu_buf.put_u8((payload[0] & 0x81) | (fu_type << 1));
-                                fu_buf.put_u8(payload[1]);
-                                fu_buf.put_slice(&payload[3..]);
-                            } else {
-                                fu_buf.put_slice(&payload[3..]);
-                            }
-
-                            if end || marker {
-                                let data = fu_buf.split().freeze();
-                                let is_keyframe = fu_type == 19 || fu_type == 20;
+                    let pts = (timestamp as u64) * 1_000_000 / sdp_info.clock_rate as u64;
+                    match &frame_codec {
+                        Codec::H264 { .. } => {
+                            if let Some(data) = h264.push(payload, marker) {
+                                // let nal_type = payload[0] & 0x1F;
+                                let is_keyframe = data.len() > 4 && (data[4] & 0x1F) == 5;
                                 let _ = tx.send(MediaFrame {
                                     camera_id: camera_id.to_string(),
                                     codec: frame_codec.clone(),
@@ -463,9 +410,130 @@ impl RtspClient {
                                 });
                             }
                         }
+                        Codec::H265 { .. } => {
+                            let nal_type = (payload[0] >> 1) & 0x3F;
+                            match nal_type {
+                                1..=47 => {
+                                    // single nal
+                                    let mut out = BytesMut::with_capacity(4 + payload.len());
+                                    out.put_u32(payload.len() as u32);
+                                    out.put_slice(payload);
+
+                                    let data = out.freeze();
+                                    let is_keyframe = matches!(nal_type, 19 | 20 | 21);
+                                    let _ = tx.send(MediaFrame {
+                                        camera_id: camera_id.to_string(),
+                                        codec: frame_codec.clone(),
+                                        pts,
+                                        is_keyframe,
+                                        data,
+                                    });
+                                }
+                                48 => {
+                                    // AP: 2-byte AP NAL header, then [2B size][NAL] repeated
+                                    let mut out = BytesMut::with_capacity(payload.len());
+                                    let mut offset = 2; // skip 2 byte AP header
+
+                                    while offset + 2 <= payload.len() {
+                                        let nal_size = u16::from_be_bytes([
+                                            payload[offset],
+                                            payload[offset + 1],
+                                        ])
+                                            as usize;
+                                        offset += 2;
+
+                                        if offset + nal_size > payload.len() {
+                                            break;
+                                        }
+
+                                        let nal = &payload[offset..offset + nal_size];
+                                        out.put_u32(nal.len() as u32);
+                                        out.put_slice(nal);
+                                        offset += nal_size;
+                                    }
+
+                                    if !out.is_empty() {
+                                        let data = out.freeze();
+                                        let _ = tx.send(MediaFrame {
+                                            camera_id: camera_id.to_string(),
+                                            codec: frame_codec.clone(),
+                                            pts,
+                                            is_keyframe: false,
+                                            data,
+                                        });
+                                    }
+                                }
+                                49 => {
+                                    let fu_hdr = payload[2];
+                                    let start = (fu_hdr & 0x80) != 0;
+                                    let end = (fu_hdr & 0x40) != 0;
+                                    let fu_type = fu_hdr & 0x3F;
+
+                                    if start {
+                                        fu_buf.clear();
+                                        fu_buf.put_u8((payload[0] & 0x81) | (fu_type << 1));
+                                        fu_buf.put_u8(payload[1]);
+                                        fu_buf.put_slice(&payload[3..]);
+                                    } else {
+                                        fu_buf.put_slice(&payload[3..]);
+                                    }
+
+                                    if end || marker {
+                                        let data = fu_buf.split().freeze();
+                                        let is_keyframe = fu_type == 19 || fu_type == 20;
+                                        let _ = tx.send(MediaFrame {
+                                            camera_id: camera_id.to_string(),
+                                            codec: frame_codec.clone(),
+                                            pts,
+                                            is_keyframe,
+                                            data,
+                                        });
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
                         _ => {}
                     }
                 }
+                2 => {
+                    // audio RTP
+                    if pkt.len() < 12 {
+                        continue;
+                    }
+                    let timestamp = u32::from_be_bytes([pkt[4], pkt[5], pkt[6], pkt[7]]);
+                    let payload = &pkt[12..];
+                    if payload.is_empty() {
+                        continue;
+                    }
+
+                    let audio_clock = sdp_info
+                        .audio
+                        .as_ref()
+                        .map(|a| a.clock_rate)
+                        .unwrap_or(8000);
+                    let pts = (timestamp as u64) * 1_000_000 / audio_clock as u64;
+
+                    let audio_codec = sdp_info.audio.as_ref().map(|a| match &a.codec {
+                        crate::rtsp::sdp::AudioCodec::Pcma => Codec::G711Pcma,
+                        crate::rtsp::sdp::AudioCodec::Pcmu => Codec::G711Pcmu,
+                        crate::rtsp::sdp::AudioCodec::Aac { config } => Codec::Aac {
+                            config: config.clone(),
+                        },
+                    });
+
+                    if let Some(codec) = audio_codec {
+                        let _ = tx.send(MediaFrame {
+                            camera_id: camera_id.to_string(),
+                            codec,
+                            pts,
+                            is_keyframe: true, // audio has no keyframes
+                            data: bytes::Bytes::copy_from_slice(payload),
+                        });
+                    }
+                }
+                1 | 3 => { /* RTCP — skip */ }
+                _ => { /* unknown — skip */ }
             }
         }
     }
@@ -524,6 +592,18 @@ impl RtspClient {
             &auth,
         )
         .await?;
+
+        if let Some(ref audio) = sdp_info.audio {
+            Self::do_setup_audio(
+                &mut stream,
+                &audio.control_url,
+                &mut self.cseq,
+                &username,
+                &password,
+                &auth,
+            )
+            .await?;
+        }
 
         let result = self
             .play_and_stream(
