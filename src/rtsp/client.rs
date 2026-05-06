@@ -479,7 +479,14 @@ impl RtspClient {
                                     }
 
                                     if end || marker {
-                                        let data = fu_buf.split().freeze();
+                                        let nal = fu_buf.split().freeze();
+
+                                        // wrap in HVCC 4-byte length prefix — same as single NAL and AP
+                                        let mut out = BytesMut::with_capacity(4 + nal.len());
+                                        out.put_u32(nal.len() as u32);
+                                        out.put_slice(&nal);
+
+                                        let data = out.freeze();
                                         let is_keyframe = fu_type == 19 || fu_type == 20;
                                         let _ = tx.send(MediaFrame {
                                             camera_id: camera_id.to_string(),
