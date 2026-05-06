@@ -136,7 +136,7 @@ fn backoff(attempt: u32) -> u64 {
 
 impl RtspClient {
     pub fn new(config: RtspConfig) -> (Self, broadcast::Receiver<MediaFrame>) {
-        let (tx, rx) = broadcast::channel(128);
+        let (tx, rx) = broadcast::channel(512);
 
         (
             Self {
