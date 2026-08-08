@@ -168,10 +168,20 @@ impl RtspClient {
         stream.write_all(req.as_bytes()).await?;
         let resp = read_response(stream).await?;
         match parse_status(&resp) {
-            Some(200) => Ok(()),
-            Some(s)   => Err(format!("OPTIONS failed: {}", s).into()),
-            None      => Err("OPTIONS: could not parse status".into()),
+            Some(200) => {}
+            Some(401) | Some(403) => {
+                // Some servers (certain Dahua firmware included) require auth on
+                // OPTIONS; others don't ask for it at all. OPTIONS is only a
+                // capability probe, not a prerequisite for DESCRIBE — rather than
+                // duplicate the full digest challenge/retry here too, treat this
+                // as non-fatal and let DESCRIBE (which already authenticates
+                // correctly) handle the real handshake.
+                eprintln!("OPTIONS requires auth — skipping, DESCRIBE will authenticate");
+            }
+            Some(s) => return Err(format!("OPTIONS failed: {}", s).into()),
+            None => return Err("OPTIONS: could not parse status".into()),
         }
+        Ok(())
     }
 
     async fn do_describe(
