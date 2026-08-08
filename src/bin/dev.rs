@@ -3,7 +3,7 @@ use camproto_ingest::rtsp::{RtspClient, RtspConfig};
 #[tokio::main]
 async fn main() {
     let config = RtspConfig {
-        url: "rtsp://admin:admin@192.168.1.240:554/rtsp/streaming?channel=5&subtype=00".into(),
+        url: "rtsp://admin:Admin%40321@192.168.1.191:554/cam/realmonitor?channel=2&subtype=0&unicast=true&proto=Onvif".into(),
         camera_id: "cam_001".into(),
     };
 

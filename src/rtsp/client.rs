@@ -5,6 +5,7 @@ use crate::rtsp::sdp::{parse_sdp, CodecParams, SdpInfo, StreamInfo};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use bytes::{BufMut, BytesMut};
 use md5;
+use percent_encoding::percent_decode_str;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -15,20 +16,24 @@ use url::Url;
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 pub struct RtspConfig {
-    pub url:       String,
+    pub url: String,
     pub camera_id: String,
 }
 
 pub struct RtspClient {
     config: RtspConfig,
-    cseq:   u32,
-    tx:     broadcast::Sender<MediaFrame>,
+    cseq: u32,
+    tx: broadcast::Sender<MediaFrame>,
 }
 
 enum Auth {
     None,
     Basic(String),
-    Digest { realm: String, nonce: String },
+    Digest {
+        realm: String,
+        nonce: String,
+        qop: Option<String>,
+    },
 }
 
 impl Auth {
@@ -36,21 +41,51 @@ impl Auth {
         match self {
             Auth::None => None,
             Auth::Basic(encoded) => Some(format!("Basic {}", encoded)),
-            Auth::Digest { realm, nonce } => {
-                Some(digest_auth(method, uri, username, password, realm, nonce))
-            }
+            Auth::Digest { realm, nonce, qop } => Some(digest_auth(
+                method, uri, username, password, realm, nonce, qop,
+            )),
         }
     }
 }
 
-fn digest_auth(method: &str, uri: &str, username: &str, password: &str, realm: &str, nonce: &str) -> String {
-    let ha1  = md5_hex(&format!("{}:{}:{}", username, realm, password));
-    let ha2  = md5_hex(&format!("{}:{}", method, uri));
-    let resp = md5_hex(&format!("{}:{}:{}", ha1, nonce, ha2));
-    format!(
-        "Digest username=\"{}\", realm=\"{}\", nonce=\"{}\", uri=\"{}\", response=\"{}\"",
-        username, realm, nonce, uri, resp
-    )
+fn digest_auth(
+    method: &str,
+    uri: &str,
+    username: &str,
+    password: &str,
+    realm: &str,
+    nonce: &str,
+    qop: &Option<String>,
+) -> String {
+    let ha1 = md5_hex(&format!("{}:{}:{}", username, realm, password));
+    let ha2 = md5_hex(&format!("{}:{}", method, uri));
+
+    match qop {
+        Some(q) if q.split(',').any(|s| s.trim() == "auth") => {
+            let cnonce = format!(
+                "{:x}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            );
+            let nc = "00000001";
+            let resp = md5_hex(&format!("{}:{}:{}:{}:auth:{}", ha1, nonce, nc, cnonce, ha2));
+            format!(
+                "Digest username=\"{}\", realm=\"{}\", nonce=\"{}\", uri=\"{}\", \
+                 response=\"{}\", qop=auth, nc={}, cnonce=\"{}\"",
+                username, realm, nonce, uri, resp, nc, cnonce
+            )
+        }
+        _ => {
+            // legacy RFC 2069, no qop
+            let resp = md5_hex(&format!("{}:{}:{}", ha1, nonce, ha2));
+            format!(
+                "Digest username=\"{}\", realm=\"{}\", nonce=\"{}\", uri=\"{}\", response=\"{}\"",
+                username, realm, nonce, uri, resp
+            )
+        }
+    }
 }
 
 fn md5_hex(input: &str) -> String {
@@ -63,7 +98,9 @@ async fn read_response(stream: &mut TcpStream) -> Result<String, BoxError> {
     loop {
         stream.read_exact(&mut buf).await?;
         response.push(buf[0]);
-        if response.ends_with(b"\r\n\r\n") { break; }
+        if response.ends_with(b"\r\n\r\n") {
+            break;
+        }
     }
     Ok(String::from_utf8_lossy(&response).into_owned())
 }
@@ -89,16 +126,32 @@ fn parse_header<'a>(response: &'a str, key: &str) -> Option<&'a str> {
 }
 
 fn parse_status(response: &str) -> Option<u16> {
-    response.lines().next()
+    response
+        .lines()
+        .next()
         .and_then(|l| l.split_whitespace().nth(1))
         .and_then(|s| s.parse().ok())
 }
 
 fn digest_param(header: &str, key: &str) -> Option<String> {
     let search = format!("{}=\"", key);
-    let start  = header.find(&search)? + search.len();
-    let end    = header[start..].find('"')? + start;
+    let start = header.find(&search)? + search.len();
+    let end = header[start..].find('"')? + start;
     Some(header[start..end].to_string())
+}
+
+fn resolve_control_url(base: &str, control: &str) -> String {
+    if control == "*" {
+        return base.to_string();
+    }
+    if control.starts_with("rtsp://") || control.starts_with("rtsps://") {
+        return control.to_string();
+    }
+    if base.ends_with('/') {
+        format!("{base}{control}")
+    } else {
+        format!("{base}/{control}")
+    }
 }
 
 fn backoff(attempt: u32) -> u64 {
@@ -134,7 +187,7 @@ fn make_rtcp_pli(our_ssrc: u32, media_ssrc: u32) -> [u8; 12] {
 
 /// Wrap RTCP bytes in an RTSP/TCP interleaved frame and write to the stream.
 async fn send_rtcp<W: AsyncWriteExt + Unpin>(
-    writer:  &mut W,
+    writer: &mut W,
     channel: u8,
     payload: &[u8],
 ) -> Result<(), BoxError> {
@@ -150,7 +203,14 @@ async fn send_rtcp<W: AsyncWriteExt + Unpin>(
 impl RtspClient {
     pub fn new(config: RtspConfig) -> (Self, broadcast::Receiver<MediaFrame>) {
         let (tx, rx) = broadcast::channel(512);
-        (Self { config, cseq: 1, tx }, rx)
+        (
+            Self {
+                config,
+                cseq: 1,
+                tx,
+            },
+            rx,
+        )
     }
 
     async fn connect(addr: &str) -> Result<TcpStream, BoxError> {
@@ -185,12 +245,13 @@ impl RtspClient {
     }
 
     async fn do_describe(
-        stream:   &mut TcpStream,
-        url:      &str,
-        cseq:     &mut u32,
+        stream: &mut TcpStream,
+        url: &str,
+        cseq: &mut u32,
         username: &str,
         password: &str,
-    ) -> Result<(Auth, String), BoxError> {
+    ) -> Result<(Auth, String, String), BoxError> {
+        // added: base_url
         let req = format!(
             "DESCRIBE {} RTSP/1.0\r\nCSeq: {}\r\nAccept: application/sdp\r\n\r\n",
             url, cseq
@@ -200,10 +261,19 @@ impl RtspClient {
         let resp = read_response(stream).await?;
 
         match parse_status(&resp) {
-            Some(200) => { let sdp = read_body(stream, &resp).await?; return Ok((Auth::None, sdp)); }
+            Some(200) => {
+                let sdp = read_body(stream, &resp).await?;
+                // Content-Base is the correct RFC-2326 base for resolving
+                // relative a=control values; fall back to the request URL
+                // if the server doesn't send one.
+                let base_url = parse_header(&resp, "content-base")
+                    .map(|s| s.trim().to_string())
+                    .unwrap_or_else(|| url.to_string());
+                return Ok((Auth::None, sdp, base_url));
+            }
             Some(401) => {}
-            Some(s)   => return Err(format!("DESCRIBE failed: {}", s).into()),
-            None      => return Err("DESCRIBE: could not parse status".into()),
+            Some(s) => return Err(format!("DESCRIBE failed: {}", s).into()),
+            None => return Err("DESCRIBE: could not parse status".into()),
         }
 
         let auth_line = parse_header(&resp, "www-authenticate")
@@ -213,33 +283,38 @@ impl RtspClient {
         } else {
             let realm = digest_param(auth_line, "realm").unwrap_or_default();
             let nonce = digest_param(auth_line, "nonce").unwrap_or_default();
-            Auth::Digest { realm, nonce }
+            let qop = digest_param(auth_line, "qop");
+            Auth::Digest { realm, nonce, qop }
         };
 
-        let auth_header = auth.header("DESCRIBE", url, username, password)
+        let auth_header = auth
+            .header("DESCRIBE", url, username, password)
             .ok_or("auth produced no header")?;
         let req2 = format!(
-            "DESCRIBE {} RTSP/1.0\r\nCSeq: {}\r\nAuthorization: {}\r\nAccept: application/sdp\r\n\r\n",
-            url, cseq, auth_header
-        );
+        "DESCRIBE {} RTSP/1.0\r\nCSeq: {}\r\nAuthorization: {}\r\nAccept: application/sdp\r\n\r\n",
+        url, cseq, auth_header
+    );
         *cseq += 1;
         stream.write_all(req2.as_bytes()).await?;
         let resp2 = read_response(stream).await?;
         match parse_status(&resp2) {
             Some(200) => {}
-            Some(s)   => return Err(format!("DESCRIBE auth retry failed: {}", s).into()),
-            None      => return Err("DESCRIBE auth retry: could not parse status".into()),
+            Some(s) => return Err(format!("DESCRIBE auth retry failed: {}", s).into()),
+            None => return Err("DESCRIBE auth retry: could not parse status".into()),
         }
         let sdp = read_body(stream, &resp2).await?;
-        Ok((auth, sdp))
+        let base_url = parse_header(&resp2, "content-base")
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|| url.to_string());
+        Ok((auth, sdp, base_url))
     }
 
     async fn do_setup(
-        stream:      &mut TcpStream,
-        setup_url:   &str,
-        cseq:        &mut u32,
-        username:    &str,
-        password:    &str,
+        stream: &mut TcpStream,
+        setup_url: &str,
+        cseq: &mut u32,
+        username: &str,
+        password: &str,
         auth_method: &Auth,
     ) -> Result<String, BoxError> {
         let mut req = format!("SETUP {} RTSP/1.0\r\nCSeq: {}\r\n", setup_url, cseq);
@@ -252,21 +327,25 @@ impl RtspClient {
         let resp = read_response(stream).await?;
         match parse_status(&resp) {
             Some(200) => {}
-            Some(s)   => return Err(format!("SETUP failed: {}", s).into()),
-            None      => return Err("SETUP: could not parse status".into()),
+            Some(s) => return Err(format!("SETUP failed: {}", s).into()),
+            None => return Err("SETUP: could not parse status".into()),
         }
         let session = parse_header(&resp, "session")
             .ok_or("SETUP response missing Session")?
-            .split(';').next().unwrap().trim().to_string();
+            .split(';')
+            .next()
+            .unwrap()
+            .trim()
+            .to_string();
         Ok(session)
     }
 
     async fn do_setup_audio(
-        stream:      &mut TcpStream,
-        audio_url:   &str,
-        cseq:        &mut u32,
-        username:    &str,
-        password:    &str,
+        stream: &mut TcpStream,
+        audio_url: &str,
+        cseq: &mut u32,
+        username: &str,
+        password: &str,
         auth_method: &Auth,
     ) -> Result<(), BoxError> {
         let mut req = format!("SETUP {} RTSP/1.0\r\nCSeq: {}\r\n", audio_url, cseq);
@@ -279,21 +358,24 @@ impl RtspClient {
         let resp = read_response(stream).await?;
         match parse_status(&resp) {
             Some(200) => Ok(()),
-            Some(s)   => Err(format!("SETUP audio failed: {}", s).into()),
-            None      => Err("SETUP audio: could not parse status".into()),
+            Some(s) => Err(format!("SETUP audio failed: {}", s).into()),
+            None => Err("SETUP audio: could not parse status".into()),
         }
     }
 
     async fn do_play(
-        stream:      &mut TcpStream,
-        url:         &str,
-        cseq:        &mut u32,
-        session:     &str,
-        username:    &str,
-        password:    &str,
+        stream: &mut TcpStream,
+        url: &str,
+        cseq: &mut u32,
+        session: &str,
+        username: &str,
+        password: &str,
         auth_method: &Auth,
     ) -> Result<(), BoxError> {
-        let mut req = format!("PLAY {} RTSP/1.0\r\nCSeq: {}\r\nSession: {}\r\n", url, cseq, session);
+        let mut req = format!(
+            "PLAY {} RTSP/1.0\r\nCSeq: {}\r\nSession: {}\r\n",
+            url, cseq, session
+        );
         if let Some(auth) = auth_method.header("PLAY", url, username, password) {
             req.push_str(&format!("Authorization: {}\r\n", auth));
         }
@@ -303,18 +385,18 @@ impl RtspClient {
         let resp = read_response(stream).await?;
         match parse_status(&resp) {
             Some(200) => Ok(()),
-            Some(s)   => Err(format!("PLAY failed: {}", s).into()),
-            None      => Err("PLAY: could not parse status".into()),
+            Some(s) => Err(format!("PLAY failed: {}", s).into()),
+            None => Err("PLAY: could not parse status".into()),
         }
     }
 
     async fn do_teardown(
-        stream:      &mut TcpStream,
-        url:         &str,
-        cseq:        &mut u32,
-        session:     &str,
-        username:    &str,
-        password:    &str,
+        stream: &mut TcpStream,
+        url: &str,
+        cseq: &mut u32,
+        session: &str,
+        username: &str,
+        password: &str,
         auth_method: &Auth,
     ) -> Result<(), BoxError> {
         let mut req = format!(
@@ -333,10 +415,10 @@ impl RtspClient {
     // ── RTP/RTCP loop ─────────────────────────────────────────────────────────
 
     async fn rtp_loop(
-        stream:    &mut TcpStream,
+        stream: &mut TcpStream,
         camera_id: &str,
-        sdp_info:  &SdpInfo,
-        tx:        &broadcast::Sender<MediaFrame>,
+        sdp_info: &SdpInfo,
+        tx: &broadcast::Sender<MediaFrame>,
     ) -> Result<(), BoxError> {
         const OUR_SSRC: u32 = 0x63616D70; // "camp" — arbitrary fixed SSRC for our side
 
@@ -354,10 +436,13 @@ impl RtspClient {
         let mut fu_buf = BytesMut::with_capacity(256 * 1024);
         let frame_codec = match &sdp_info.codec {
             CodecParams::H265 { vps, sps, pps } => Codec::H265 {
-                vps: vps.clone(), pps: pps.clone(), sps: sps.clone(),
+                vps: vps.clone(),
+                pps: pps.clone(),
+                sps: sps.clone(),
             },
             CodecParams::H264 { sps, pps } => Codec::H264 {
-                sps: sps.clone(), pps: pps.clone(),
+                sps: sps.clone(),
+                pps: pps.clone(),
             },
         };
         let mut h264 = H264Depackatizer::new();
@@ -381,21 +466,27 @@ impl RtspClient {
                 }
             }
 
-            if hdr[0] != b'$' { continue; }
+            if hdr[0] != b'$' {
+                continue;
+            }
 
             let channel = hdr[1];
-            let length  = u16::from_be_bytes([hdr[2], hdr[3]]) as usize;
+            let length = u16::from_be_bytes([hdr[2], hdr[3]]) as usize;
             let mut pkt = vec![0u8; length];
             reader.read_exact(&mut pkt).await?;
 
             match channel {
                 0 => {
                     // RTP video
-                    if pkt.len() < 12 { continue; }
-                    let marker    = (pkt[1] & 0x80) != 0;
+                    if pkt.len() < 12 {
+                        continue;
+                    }
+                    let marker = (pkt[1] & 0x80) != 0;
                     let timestamp = u32::from_be_bytes([pkt[4], pkt[5], pkt[6], pkt[7]]);
-                    let payload   = &pkt[12..];
-                    if payload.is_empty() { continue; }
+                    let payload = &pkt[12..];
+                    if payload.is_empty() {
+                        continue;
+                    }
                     let pts = (timestamp as u64) * 1_000_000 / sdp_info.clock_rate as u64;
 
                     match &frame_codec {
@@ -405,7 +496,9 @@ impl RtspClient {
                                 let _ = tx.send(MediaFrame {
                                     camera_id: camera_id.to_string(),
                                     codec: frame_codec.clone(),
-                                    pts, is_keyframe, data,
+                                    pts,
+                                    is_keyframe,
+                                    data,
                                 });
                             }
                         }
@@ -421,18 +514,25 @@ impl RtspClient {
                                     let _ = tx.send(MediaFrame {
                                         camera_id: camera_id.to_string(),
                                         codec: frame_codec.clone(),
-                                        pts, is_keyframe,
+                                        pts,
+                                        is_keyframe,
                                         data: out.freeze(),
                                     });
                                 }
                                 48 => {
                                     // Aggregation packet
-                                    let mut out    = BytesMut::with_capacity(payload.len());
+                                    let mut out = BytesMut::with_capacity(payload.len());
                                     let mut offset = 2;
                                     while offset + 2 <= payload.len() {
-                                        let nal_size = u16::from_be_bytes([payload[offset], payload[offset+1]]) as usize;
+                                        let nal_size = u16::from_be_bytes([
+                                            payload[offset],
+                                            payload[offset + 1],
+                                        ])
+                                            as usize;
                                         offset += 2;
-                                        if offset + nal_size > payload.len() { break; }
+                                        if offset + nal_size > payload.len() {
+                                            break;
+                                        }
                                         let nal = &payload[offset..offset + nal_size];
                                         out.put_u32(nal.len() as u32);
                                         out.put_slice(nal);
@@ -442,16 +542,17 @@ impl RtspClient {
                                         let _ = tx.send(MediaFrame {
                                             camera_id: camera_id.to_string(),
                                             codec: frame_codec.clone(),
-                                            pts, is_keyframe: false,
+                                            pts,
+                                            is_keyframe: false,
                                             data: out.freeze(),
                                         });
                                     }
                                 }
                                 49 => {
                                     // FU (fragmentation)
-                                    let fu_hdr  = payload[2];
-                                    let start   = (fu_hdr & 0x80) != 0;
-                                    let end     = (fu_hdr & 0x40) != 0;
+                                    let fu_hdr = payload[2];
+                                    let start = (fu_hdr & 0x80) != 0;
+                                    let end = (fu_hdr & 0x40) != 0;
                                     let fu_type = fu_hdr & 0x3F;
                                     if start {
                                         fu_buf.clear();
@@ -470,7 +571,8 @@ impl RtspClient {
                                         let _ = tx.send(MediaFrame {
                                             camera_id: camera_id.to_string(),
                                             codec: frame_codec.clone(),
-                                            pts, is_keyframe,
+                                            pts,
+                                            is_keyframe,
                                             data: out.freeze(),
                                         });
                                     }
@@ -483,27 +585,39 @@ impl RtspClient {
                 }
                 2 => {
                     // RTP audio
-                    if pkt.len() < 12 { continue; }
-                    let timestamp  = u32::from_be_bytes([pkt[4], pkt[5], pkt[6], pkt[7]]);
-                    let payload    = &pkt[12..];
-                    if payload.is_empty() { continue; }
-                    let audio_clock = sdp_info.audio.as_ref().map(|a| a.clock_rate).unwrap_or(8000);
+                    if pkt.len() < 12 {
+                        continue;
+                    }
+                    let timestamp = u32::from_be_bytes([pkt[4], pkt[5], pkt[6], pkt[7]]);
+                    let payload = &pkt[12..];
+                    if payload.is_empty() {
+                        continue;
+                    }
+                    let audio_clock = sdp_info
+                        .audio
+                        .as_ref()
+                        .map(|a| a.clock_rate)
+                        .unwrap_or(8000);
                     let pts = (timestamp as u64) * 1_000_000 / audio_clock as u64;
                     let audio_codec = sdp_info.audio.as_ref().map(|a| match &a.codec {
-                        crate::rtsp::sdp::AudioCodec::Pcma      => Codec::G711Pcma,
-                        crate::rtsp::sdp::AudioCodec::Pcmu      => Codec::G711Pcmu,
-                        crate::rtsp::sdp::AudioCodec::Aac { config } => Codec::Aac { config: config.clone() },
+                        crate::rtsp::sdp::AudioCodec::Pcma => Codec::G711Pcma,
+                        crate::rtsp::sdp::AudioCodec::Pcmu => Codec::G711Pcmu,
+                        crate::rtsp::sdp::AudioCodec::Aac { config } => Codec::Aac {
+                            config: config.clone(),
+                        },
                     });
                     if let Some(codec) = audio_codec {
                         let _ = tx.send(MediaFrame {
                             camera_id: camera_id.to_string(),
-                            codec, pts, is_keyframe: true,
+                            codec,
+                            pts,
+                            is_keyframe: true,
                             data: bytes::Bytes::copy_from_slice(payload),
                         });
                     }
                 }
                 1 | 3 => { /* incoming RTCP from camera — ignore, we send our own */ }
-                _     => {}
+                _ => {}
             }
         }
     }
@@ -514,13 +628,13 @@ impl RtspClient {
         let mut attempt = 0u32;
         loop {
             match self.connect_and_stream().await {
-                Ok(())  => break,
-                Err(e)  => {
+                Ok(()) => break,
+                Err(e) => {
                     let secs = backoff(attempt);
                     println!("disconnected: {} - retrying in {}s", e, secs);
                     tokio::time::sleep(Duration::from_secs(secs)).await;
                     self.cseq = 1;
-                    attempt  += 1;
+                    attempt += 1;
                 }
             }
         }
@@ -528,75 +642,169 @@ impl RtspClient {
     }
 
     async fn connect_and_stream(&mut self) -> Result<(), BoxError> {
-        let parsed   = Url::parse(&self.config.url)?;
-        let host     = parsed.host_str().ok_or("missing host")?;
-        let port     = parsed.port().unwrap_or(554);
-        let addr     = format!("{}:{}", host, port);
-        let username = parsed.username().to_string();
-        let password = parsed.password().unwrap_or("").to_string();
+        let parsed = Url::parse(&self.config.url)?;
+        let host = parsed.host_str().ok_or("missing host")?;
+        let port = parsed.port().unwrap_or(554);
+        let addr = format!("{}:{}", host, port);
+        let username = percent_decode_str(parsed.username())
+            .decode_utf8()
+            .map(|s| s.into_owned())
+            .unwrap_or_default();
+        let password = percent_decode_str(parsed.password().unwrap_or(""))
+            .decode_utf8()
+            .map(|s| s.into_owned())
+            .unwrap_or_default();
+
+        // The RTSP request-line URI (and therefore the digest `uri=` value) must
+        // NOT contain embedded credentials — only the Authorization header does.
+        // self.config.url has them (that's how we pass creds in); strip before
+        // using it as a wire-level URI anywhere.
+        let mut clean = parsed.clone();
+        let _ = clean.set_username("");
+        let _ = clean.set_password(None);
+        let clean_url = strip_userinfo(&self.config.url);
 
         let mut stream = Self::connect(&addr).await?;
         println!("connected to {}", addr);
 
-        Self::do_options(&mut stream, &self.config.url, &mut self.cseq).await?;
+        Self::do_options(&mut stream, &clean_url, &mut self.cseq).await?;
 
-        let (auth, sdp) = Self::do_describe(
-            &mut stream, &self.config.url, &mut self.cseq, &username, &password,
-        ).await?;
+        let (auth, sdp, base_url) = Self::do_describe(
+            &mut stream,
+            &clean_url,
+            &mut self.cseq,
+            &username,
+            &password,
+        )
+        .await?;
 
-        let sdp_info  = parse_sdp(&sdp)?;
-        let setup_url = sdp_info.control_url.clone();
+        let sdp_info = parse_sdp(&sdp)?;
+        let setup_url = resolve_control_url(&base_url, &sdp_info.control_url);
 
         let session = Self::do_setup(
-            &mut stream, &setup_url, &mut self.cseq, &username, &password, &auth,
-        ).await?;
+            &mut stream,
+            &setup_url,
+            &mut self.cseq,
+            &username,
+            &password,
+            &auth,
+        )
+        .await?;
 
         if let Some(ref audio) = sdp_info.audio {
+            let audio_setup_url = resolve_control_url(&base_url, &audio.control_url);
             Self::do_setup_audio(
-                &mut stream, &audio.control_url, &mut self.cseq, &username, &password, &auth,
-            ).await?;
+                &mut stream,
+                &audio_setup_url,
+                &mut self.cseq,
+                &username,
+                &password,
+                &auth,
+            )
+            .await?;
         }
 
-        let result = self.play_and_stream(&mut stream, &sdp_info, &session, &auth, &username, &password).await;
+        let result = self
+            .play_and_stream(
+                &mut stream,
+                &clean_url,
+                &sdp_info,
+                &session,
+                &auth,
+                &username,
+                &password,
+            )
+            .await;
 
         Self::do_teardown(
-            &mut stream, &self.config.url, &mut self.cseq, &session, &username, &password, &auth,
-        ).await.ok();
+            &mut stream,
+            &clean_url,
+            &mut self.cseq,
+            &session,
+            &username,
+            &password,
+            &auth,
+        )
+        .await
+        .ok();
 
         result
     }
 
     async fn play_and_stream(
         &mut self,
-        stream:   &mut TcpStream,
+        stream: &mut TcpStream,
+        url: &str,
         sdp_info: &SdpInfo,
-        session:  &str,
-        auth:     &Auth,
+        session: &str,
+        auth: &Auth,
         username: &str,
         password: &str,
     ) -> Result<(), BoxError> {
-        Self::do_play(stream, &self.config.url, &mut self.cseq, session, username, password, auth).await?;
+        Self::do_play(
+            stream,
+            url,
+            &mut self.cseq,
+            session,
+            username,
+            password,
+            auth,
+        )
+        .await?;
         println!("streaming camera_id={}", self.config.camera_id);
         Self::rtp_loop(stream, &self.config.camera_id, sdp_info, &self.tx).await
     }
 
     pub async fn probe(&self) -> Result<StreamInfo, BoxError> {
-        let parsed   = Url::parse(&self.config.url)?;
-        let host     = parsed.host_str().ok_or("missing host")?;
-        let port     = parsed.port().unwrap_or(554);
-        let addr     = format!("{}:{}", host, port);
-        let username = parsed.username().to_string();
-        let password = parsed.password().unwrap_or("").to_string();
+        let parsed = Url::parse(&self.config.url)?;
+        let host = parsed.host_str().ok_or("missing host")?;
+        let port = parsed.port().unwrap_or(554);
+        let addr = format!("{}:{}", host, port);
+        let username = percent_decode_str(parsed.username())
+            .decode_utf8()
+            .map(|s| s.into_owned())
+            .unwrap_or_default();
+        let password = percent_decode_str(parsed.password().unwrap_or(""))
+            .decode_utf8()
+            .map(|s| s.into_owned())
+            .unwrap_or_default();
         let camera_ip = host.to_string();
+
+        let mut clean = parsed.clone();
+        let _ = clean.set_username("");
+        let _ = clean.set_password(None);
+
+        let clean_url = strip_userinfo(&self.config.url);
 
         let mut stream = Self::connect(&addr).await?;
         let mut cseq = 1u32;
 
-        Self::do_options(&mut stream, &self.config.url, &mut cseq).await?;
-        let (_, sdp) = Self::do_describe(&mut stream, &self.config.url, &mut cseq, &username, &password).await?;
+        Self::do_options(&mut stream, &clean_url, &mut cseq).await?;
+        let (_, sdp, _base_url) =
+            Self::do_describe(&mut stream, &clean_url, &mut cseq, &username, &password).await?;
         drop(stream);
 
         let sdp_info = parse_sdp(&sdp)?;
         Ok(sdp_info.to_stream_info(&self.config.camera_id, &camera_ip, &sdp_info.session_name))
     }
+}
+
+fn strip_userinfo(url: &str) -> String {
+    let Some(scheme_end) = url.find("://") else {
+        return url.to_string();
+    };
+    let after_scheme = scheme_end + 3;
+    let Some(at_pos) = url[after_scheme..].find('@') else {
+        return url.to_string();
+    };
+    // Only treat this '@' as userinfo if it comes before the first '/' —
+    // otherwise it's inside the path/query, not part of the authority.
+    let slash_pos = url[after_scheme..].find('/').unwrap_or(usize::MAX);
+    if at_pos >= slash_pos {
+        return url.to_string();
+    }
+    let mut out = String::with_capacity(url.len());
+    out.push_str(&url[..after_scheme]);
+    out.push_str(&url[after_scheme + at_pos + 1..]);
+    out
 }

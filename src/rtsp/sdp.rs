@@ -211,11 +211,12 @@ pub fn parse_sdp(sdp: &str) -> Result<SdpInfo, BoxError> {
         _ => unreachable!(), // already handled above
     };
 
-    let control_url = sdp
+    let video_section_start = sdp.find("m=video").ok_or("no video m in sdp")?;
+    let control_url = sdp[video_section_start..]
         .lines()
         .find(|l| l.starts_with("a=control:"))
         .and_then(|l| l.strip_prefix("a=control:"))
-        .ok_or("no a=control in SDP")?
+        .ok_or("no a=control in SDP video section")?
         .trim()
         .to_string();
 
