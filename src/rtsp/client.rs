@@ -1061,7 +1061,7 @@ impl RtspClient {
             auth,
         )
         .await?;
-        DEBUG!("streaming camera_id={}", self.config.camera_id);
+        eprintln!("DEBUG streaming camera_id={}", self.config.camera_id);
         Self::rtp_loop(stream, &self.config.camera_id, sdp_info, &self.tx).await
     }
 
