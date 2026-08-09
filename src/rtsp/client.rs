@@ -3,7 +3,7 @@ use crate::rtp::h264::H264Depackatizer;
 use crate::rtsp::sdp::{parse_sdp, CodecParams, SdpInfo, StreamInfo};
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
-use bytes::{BufMut, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut};
 use md5;
 use percent_encoding::percent_decode_str;
 use std::time::Duration;
@@ -34,6 +34,77 @@ enum Auth {
         nonce: String,
         qop: Option<String>,
     },
+}
+
+// ── RTCP helpers ─────
+fn h265_nal_type(nal: &[u8]) -> Option<u8> {
+    if nal.len() < 2 {
+        return None;
+    }
+
+    Some((nal[0] >> 1) & 0x3F)
+}
+
+fn is_h265_keyframe(nal_type: u8) -> bool {
+    matches!(nal_type, 16..=21)
+}
+
+fn append_h265_nal(out: &mut BytesMut, nal: &[u8]) {
+    out.put_u32(nal.len() as u32);
+    out.put_slice(nal);
+}
+
+fn update_h265_parameter_sets(nal: &[u8], vps: &mut Bytes, sps: &mut Bytes, pps: &mut Bytes) {
+    let Some(nal_type) = h265_nal_type(nal) else {
+        return;
+    };
+
+    match nal_type {
+        32 => {
+            *vps = Bytes::copy_from_slice(nal);
+        }
+
+        33 => {
+            *sps = Bytes::copy_from_slice(nal);
+        }
+
+        34 => {
+            *pps = Bytes::copy_from_slice(nal);
+        }
+
+        _ => {}
+    }
+}
+
+fn publish_h265_access_unit(
+    tx: &broadcast::Sender<MediaFrame>,
+    camera_id: &str,
+    data: Bytes,
+    pts: u64,
+    is_keyframe: bool,
+    vps: &Bytes,
+    sps: &Bytes,
+    pps: &Bytes,
+) {
+    if data.is_empty() {
+        return;
+    }
+
+    let _ = tx.send(MediaFrame {
+        camera_id: camera_id.to_string(),
+
+        codec: Codec::H265 {
+            vps: vps.clone(),
+            sps: sps.clone(),
+            pps: pps.clone(),
+        },
+
+        pts,
+
+        is_keyframe,
+
+        data,
+    });
 }
 
 impl Auth {
@@ -347,14 +418,19 @@ impl RtspClient {
         username: &str,
         password: &str,
         auth_method: &Auth,
+        session: &str,
     ) -> Result<(), BoxError> {
-        let mut req = format!("SETUP {} RTSP/1.0\r\nCSeq: {}\r\n", audio_url, cseq);
+        let mut req = format!(
+            "SETUP {} RTSP/1.0\r\nCSeq: {}\r\nSession: {}\r\n",
+            audio_url, cseq, session
+        );
         if let Some(auth) = auth_method.header("SETUP", audio_url, username, password) {
             req.push_str(&format!("Authorization: {}\r\n", auth));
         }
         req.push_str("Transport: RTP/AVP/TCP;unicast;interleaved=2-3\r\n\r\n");
         *cseq += 1;
         stream.write_all(req.as_bytes()).await?;
+
         let resp = read_response(stream).await?;
         match parse_status(&resp) {
             Some(200) => Ok(()),
@@ -420,44 +496,91 @@ impl RtspClient {
         sdp_info: &SdpInfo,
         tx: &broadcast::Sender<MediaFrame>,
     ) -> Result<(), BoxError> {
-        const OUR_SSRC: u32 = 0x63616D70; // "camp" — arbitrary fixed SSRC for our side
+        const OUR_SSRC: u32 = 0x63616D70;
 
         let (mut reader, mut writer) = stream.split();
 
-        // Send PLI immediately — camera sends IDR keyframe within ~1 frame interval
-        // instead of waiting for the next GOP boundary (2-10 seconds on many cameras)
+        // Request an IDR/keyframe.
         let pli = make_rtcp_pli(OUR_SSRC, 0);
         let _ = send_rtcp(&mut writer, 1, &pli).await;
 
-        // RTCP RR keepalive — cameras drop the connection after ~30-60s without feedback
+        // RTCP keepalive.
         let mut keepalive = tokio::time::interval(Duration::from_secs(5));
-        keepalive.tick().await; // skip the first immediate tick
+
+        keepalive.tick().await;
+
+        // ---------------------------------------------------------
+        // RTP timestamp normalization
+        // ---------------------------------------------------------
+
+        let mut video_base_timestamp: Option<u32> = None;
+        let mut audio_base_timestamp: Option<u32> = None;
+
+        // ---------------------------------------------------------
+        // H264 state
+        // ---------------------------------------------------------
+
+        let mut h264 = H264Depackatizer::new();
+
+        // ---------------------------------------------------------
+        // H265 FU reconstruction
+        // ---------------------------------------------------------
 
         let mut fu_buf = BytesMut::with_capacity(256 * 1024);
+
+        // ---------------------------------------------------------
+        // H265 Access Unit aggregation
+        // ---------------------------------------------------------
+
+        let mut h265_au = BytesMut::with_capacity(512 * 1024);
+
+        let mut h265_au_timestamp: Option<u32> = None;
+
+        let mut h265_au_pts: u64 = 0;
+
+        let mut h265_au_keyframe = false;
+
+        let mut h265_au_has_vcl = false;
+
+        // ---------------------------------------------------------
+        // H265 parameter-set cache
+        // ---------------------------------------------------------
+
+        let (mut h265_vps, mut h265_sps, mut h265_pps) = match &sdp_info.codec {
+            CodecParams::H265 { vps, sps, pps } => (vps.clone(), sps.clone(), pps.clone()),
+
+            _ => (Bytes::new(), Bytes::new(), Bytes::new()),
+        };
+
+        // ---------------------------------------------------------
+        // Base codec
+        // ---------------------------------------------------------
+
         let frame_codec = match &sdp_info.codec {
             CodecParams::H265 { vps, sps, pps } => Codec::H265 {
                 vps: vps.clone(),
-                pps: pps.clone(),
                 sps: sps.clone(),
+                pps: pps.clone(),
             },
+
             CodecParams::H264 { sps, pps } => Codec::H264 {
                 sps: sps.clone(),
                 pps: pps.clone(),
             },
         };
-        let mut h264 = H264Depackatizer::new();
 
         loop {
-            // Interleaved frame header: $ channel(1B) length(2B BE)
             let mut hdr = [0u8; 4];
 
             tokio::select! {
                 biased;
 
-                // Keepalive fires every 5s — send RTCP RR on RTCP channel (1)
                 _ = keepalive.tick() => {
                     let rr = make_rtcp_rr(OUR_SSRC);
-                    let _ = send_rtcp(&mut writer, 1, &rr).await;
+
+                    let _ =
+                        send_rtcp(&mut writer, 1, &rr).await;
+
                     continue;
                 }
 
@@ -466,157 +589,330 @@ impl RtspClient {
                 }
             }
 
+            // RTSP/TCP interleaved RTP begins with '$'
             if hdr[0] != b'$' {
                 continue;
             }
 
             let channel = hdr[1];
+
             let length = u16::from_be_bytes([hdr[2], hdr[3]]) as usize;
+
             let mut pkt = vec![0u8; length];
+
             reader.read_exact(&mut pkt).await?;
 
             match channel {
+                // =================================================
+                // VIDEO RTP
+                // =================================================
                 0 => {
-                    // RTP video
                     if pkt.len() < 12 {
                         continue;
                     }
+
                     let marker = (pkt[1] & 0x80) != 0;
+
                     let timestamp = u32::from_be_bytes([pkt[4], pkt[5], pkt[6], pkt[7]]);
+
                     let payload = &pkt[12..];
+
                     if payload.is_empty() {
                         continue;
                     }
-                    let pts = (timestamp as u64) * 1_000_000 / sdp_info.clock_rate as u64;
+
+                    // ---------------------------------------------
+                    // Normalize RTP timestamp so stream starts at 0
+                    // ---------------------------------------------
+
+                    let base_timestamp = *video_base_timestamp.get_or_insert(timestamp);
+
+                    let relative_timestamp = timestamp.wrapping_sub(base_timestamp);
+
+                    let pts = relative_timestamp as u64 * 1_000_000 / sdp_info.clock_rate as u64;
 
                     match &frame_codec {
+                        // =========================================
+                        // H264
+                        // =========================================
                         Codec::H264 { .. } => {
                             if let Some(data) = h264.push(payload, marker) {
                                 let is_keyframe = data.len() > 4 && (data[4] & 0x1F) == 5;
+
                                 let _ = tx.send(MediaFrame {
                                     camera_id: camera_id.to_string(),
+
                                     codec: frame_codec.clone(),
+
                                     pts,
+
                                     is_keyframe,
+
                                     data,
                                 });
                             }
                         }
+
+                        // =========================================
+                        // H265
+                        // =========================================
                         Codec::H265 { .. } => {
+                            if payload.len() < 2 {
+                                continue;
+                            }
+
                             let nal_type = (payload[0] >> 1) & 0x3F;
-                            match nal_type {
-                                1..=47 => {
-                                    // Single NAL
-                                    let mut out = BytesMut::with_capacity(4 + payload.len());
-                                    out.put_u32(payload.len() as u32);
-                                    out.put_slice(payload);
-                                    let is_keyframe = matches!(nal_type, 19 | 20 | 21);
-                                    let _ = tx.send(MediaFrame {
-                                        camera_id: camera_id.to_string(),
-                                        codec: frame_codec.clone(),
-                                        pts,
-                                        is_keyframe,
-                                        data: out.freeze(),
-                                    });
+
+                            // -------------------------------------
+                            // New timestamp means new access unit.
+                            //
+                            // Normally marker=true flushes the AU.
+                            // This is a safety fallback for cameras
+                            // with unreliable marker behaviour.
+                            // -------------------------------------
+
+                            if let Some(old_timestamp) = h265_au_timestamp {
+                                if old_timestamp != timestamp {
+                                    if !h265_au.is_empty() && h265_au_has_vcl {
+                                        let data = h265_au.split().freeze();
+
+                                        publish_h265_access_unit(
+                                            tx,
+                                            camera_id,
+                                            data,
+                                            h265_au_pts,
+                                            h265_au_keyframe,
+                                            &h265_vps,
+                                            &h265_sps,
+                                            &h265_pps,
+                                        );
+                                    } else {
+                                        h265_au.clear();
+                                    }
+
+                                    h265_au_keyframe = false;
+
+                                    h265_au_has_vcl = false;
+
+                                    fu_buf.clear();
                                 }
+                            }
+
+                            if h265_au_timestamp != Some(timestamp) {
+                                h265_au_timestamp = Some(timestamp);
+
+                                h265_au_pts = pts;
+
+                                h265_au_keyframe = false;
+
+                                h265_au_has_vcl = false;
+                            }
+
+                            // -------------------------------------
+                            // A packet can result in one or more
+                            // complete NAL units.
+                            // -------------------------------------
+
+                            let mut complete_nals: Vec<Vec<u8>> = Vec::new();
+
+                            match nal_type {
+                                // =================================
+                                // Single NAL Unit
+                                // =================================
+                                0..=47 => {
+                                    complete_nals.push(payload.to_vec());
+                                }
+
+                                // =================================
+                                // Aggregation Packet (AP)
+                                // =================================
                                 48 => {
-                                    // Aggregation packet
-                                    let mut out = BytesMut::with_capacity(payload.len());
                                     let mut offset = 2;
+
                                     while offset + 2 <= payload.len() {
                                         let nal_size = u16::from_be_bytes([
                                             payload[offset],
                                             payload[offset + 1],
                                         ])
                                             as usize;
+
                                         offset += 2;
+
                                         if offset + nal_size > payload.len() {
                                             break;
                                         }
-                                        let nal = &payload[offset..offset + nal_size];
-                                        out.put_u32(nal.len() as u32);
-                                        out.put_slice(nal);
+
+                                        complete_nals
+                                            .push(payload[offset..offset + nal_size].to_vec());
+
                                         offset += nal_size;
                                     }
-                                    if !out.is_empty() {
-                                        let _ = tx.send(MediaFrame {
-                                            camera_id: camera_id.to_string(),
-                                            codec: frame_codec.clone(),
-                                            pts,
-                                            is_keyframe: false,
-                                            data: out.freeze(),
-                                        });
-                                    }
                                 }
+
+                                // =================================
+                                // Fragmentation Unit (FU)
+                                // =================================
                                 49 => {
-                                    // FU (fragmentation)
-                                    let fu_hdr = payload[2];
-                                    let start = (fu_hdr & 0x80) != 0;
-                                    let end = (fu_hdr & 0x40) != 0;
-                                    let fu_type = fu_hdr & 0x3F;
+                                    if payload.len() < 3 {
+                                        continue;
+                                    }
+
+                                    let fu_header = payload[2];
+
+                                    let start = (fu_header & 0x80) != 0;
+
+                                    let end = (fu_header & 0x40) != 0;
+
+                                    let fu_type = fu_header & 0x3F;
+
                                     if start {
                                         fu_buf.clear();
+
+                                        // Reconstruct original
+                                        // H265 two-byte NAL header.
                                         fu_buf.put_u8((payload[0] & 0x81) | (fu_type << 1));
+
                                         fu_buf.put_u8(payload[1]);
+
                                         fu_buf.put_slice(&payload[3..]);
                                     } else {
+                                        if fu_buf.is_empty() {
+                                            // We lost the FU start.
+                                            continue;
+                                        }
+
                                         fu_buf.put_slice(&payload[3..]);
                                     }
-                                    if end || marker {
-                                        let nal = fu_buf.split().freeze();
-                                        let mut out = BytesMut::with_capacity(4 + nal.len());
-                                        out.put_u32(nal.len() as u32);
-                                        out.put_slice(&nal);
-                                        let is_keyframe = matches!(fu_type, 19 | 20);
-                                        let _ = tx.send(MediaFrame {
-                                            camera_id: camera_id.to_string(),
-                                            codec: frame_codec.clone(),
-                                            pts,
-                                            is_keyframe,
-                                            data: out.freeze(),
-                                        });
+
+                                    if end && !fu_buf.is_empty() {
+                                        complete_nals.push(fu_buf.split().to_vec());
                                     }
                                 }
+
                                 _ => {}
                             }
+
+                            // -------------------------------------
+                            // Process completed H265 NALs
+                            // -------------------------------------
+
+                            for nal in complete_nals {
+                                let Some(current_type) = h265_nal_type(&nal) else {
+                                    continue;
+                                };
+
+                                // Capture VPS/SPS/PPS arriving
+                                // inside RTP.
+                                update_h265_parameter_sets(
+                                    &nal,
+                                    &mut h265_vps,
+                                    &mut h265_sps,
+                                    &mut h265_pps,
+                                );
+
+                                // H265 VCL range is 0..31.
+                                if current_type <= 31 {
+                                    h265_au_has_vcl = true;
+                                }
+
+                                if is_h265_keyframe(current_type) {
+                                    h265_au_keyframe = true;
+                                }
+
+                                append_h265_nal(&mut h265_au, &nal);
+                            }
+
+                            // -------------------------------------
+                            // RTP marker = end of picture/AU
+                            // -------------------------------------
+
+                            if marker {
+                                if !h265_au.is_empty() && h265_au_has_vcl {
+                                    let data = h265_au.split().freeze();
+
+                                    publish_h265_access_unit(
+                                        tx,
+                                        camera_id,
+                                        data,
+                                        h265_au_pts,
+                                        h265_au_keyframe,
+                                        &h265_vps,
+                                        &h265_sps,
+                                        &h265_pps,
+                                    );
+                                } else {
+                                    h265_au.clear();
+                                }
+
+                                h265_au_timestamp = None;
+
+                                h265_au_keyframe = false;
+
+                                h265_au_has_vcl = false;
+                            }
                         }
+
                         _ => {}
                     }
                 }
+
+                // =================================================
+                // AUDIO RTP
+                // =================================================
                 2 => {
-                    // RTP audio
                     if pkt.len() < 12 {
                         continue;
                     }
+
                     let timestamp = u32::from_be_bytes([pkt[4], pkt[5], pkt[6], pkt[7]]);
+
                     let payload = &pkt[12..];
+
                     if payload.is_empty() {
                         continue;
                     }
+
                     let audio_clock = sdp_info
                         .audio
                         .as_ref()
-                        .map(|a| a.clock_rate)
+                        .map(|audio| audio.clock_rate)
                         .unwrap_or(8000);
-                    let pts = (timestamp as u64) * 1_000_000 / audio_clock as u64;
-                    let audio_codec = sdp_info.audio.as_ref().map(|a| match &a.codec {
+
+                    // Normalize audio PTS also.
+                    let base_timestamp = *audio_base_timestamp.get_or_insert(timestamp);
+
+                    let relative_timestamp = timestamp.wrapping_sub(base_timestamp);
+
+                    let pts = relative_timestamp as u64 * 1_000_000 / audio_clock as u64;
+
+                    let audio_codec = sdp_info.audio.as_ref().map(|audio| match &audio.codec {
                         crate::rtsp::sdp::AudioCodec::Pcma => Codec::G711Pcma,
+
                         crate::rtsp::sdp::AudioCodec::Pcmu => Codec::G711Pcmu,
+
                         crate::rtsp::sdp::AudioCodec::Aac { config } => Codec::Aac {
                             config: config.clone(),
                         },
                     });
+
                     if let Some(codec) = audio_codec {
                         let _ = tx.send(MediaFrame {
                             camera_id: camera_id.to_string(),
+
                             codec,
+
                             pts,
+
                             is_keyframe: true,
-                            data: bytes::Bytes::copy_from_slice(payload),
+
+                            data: Bytes::copy_from_slice(payload),
                         });
                     }
                 }
-                1 | 3 => { /* incoming RTCP from camera — ignore, we send our own */ }
+
+                // RTCP
+                1 | 3 => {}
+
                 _ => {}
             }
         }
@@ -693,17 +989,34 @@ impl RtspClient {
 
         if let Some(ref audio) = sdp_info.audio {
             let audio_setup_url = resolve_control_url(&base_url, &audio.control_url);
-            Self::do_setup_audio(
+            match Self::do_setup_audio(
                 &mut stream,
                 &audio_setup_url,
                 &mut self.cseq,
                 &username,
                 &password,
                 &auth,
+                &session,
             )
-            .await?;
+            .await
+            {
+                Ok(()) => {
+                    println!("audio SETUP successful");
+                }
+
+                Err(e) => {
+                    eprintln!("audio SETUP failed: {} — continuing video-only", e);
+                }
+            };
         }
 
+        println!("VIDEO SETUP OK session={}", session);
+
+        if sdp_info.audio.is_some() {
+            println!("AUDIO TRACK PRESENT");
+        }
+
+        println!("SENDING PLAY");
         let result = self
             .play_and_stream(
                 &mut stream,
