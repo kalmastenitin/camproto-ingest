@@ -175,39 +175,59 @@ pub fn parse_sdp(sdp: &str) -> Result<SdpInfo, BoxError> {
         other => return Err(format!("unsupported codec: {}", other).into()),
     }
 
+    eprintln!("DEBUG full SDP body:\n {sdp}");
+
     // ── Now safe to require fmtp ─────────────────────────────────────────────
     let fmtp_prefix = format!("a=fmtp:{}", payload_type);
-    let fmtp_line = sdp
-        .lines()
-        .find(|l| l.starts_with(&fmtp_prefix))
-        .ok_or("no a=fmtp present in sdp")?;
+    let fmtp_line = sdp.lines().find(|l| l.starts_with(&fmtp_prefix));
 
     let codec = match codec_name {
         "H265" | "H265+" | "HEVC" => {
-            let vps = parse_fmtp_param(fmtp_line, "sprop-vps")?;
-            let sps = parse_fmtp_param(fmtp_line, "sprop-sps")?;
-            let pps = parse_fmtp_param(fmtp_line, "sprop-pps")?;
-            CodecParams::H265 { vps, sps, pps }
+            if let Some(line) = fmtp_line {
+                let vps = parse_fmtp_param(line, "sprop-vps").unwrap_or_default();
+                let sps = parse_fmtp_param(line, "sprop-sps").unwrap_or_default();
+                let pps = parse_fmtp_param(line, "sprop-pps").unwrap_or_default();
+                CodecParams::H265 { vps, sps, pps }
+            } else {
+                CodecParams::H265 {
+                    vps: Bytes::new(),
+                    sps: Bytes::new(),
+                    pps: Bytes::new(),
+                }
+            }
         }
         "H264" | "H264+" | "AVC" => {
-            let params = fmtp_line
-                .find("sprop-parameter-sets=")
-                .map(|i| &fmtp_line[i + "sprop-parameter-sets=".len()..])
-                .ok_or("H264: no sprop-parameter-sets")?;
-            let mut it = params.split(',');
-            let sps = Bytes::from(B64.decode(it.next().unwrap_or("").trim())?);
-            let pps = Bytes::from(
-                B64.decode(
-                    it.next()
-                        .unwrap_or("")
-                        .trim()
-                        .split(';')
-                        .next()
-                        .unwrap_or(""),
-                )?,
-            );
-            CodecParams::H264 { sps, pps }
+            if let Some(line) = fmtp_line {
+                if let Some(i) = line.find("sprop-parameter-sets=") {
+                    let params = &line[i + "sprop-parameter-sets=".len()..];
+                    let mut it = params.split(',');
+                    let sps = Bytes::from(B64.decode(it.next().unwrap_or("").trim())?);
+                    let pps = Bytes::from(
+                        B64.decode(
+                            it.next()
+                                .unwrap_or("")
+                                .trim()
+                                .split(';')
+                                .next()
+                                .unwrap_or(""),
+                        )
+                        .unwrap_or_default(),
+                    );
+                    CodecParams::H264 { sps, pps }
+                } else {
+                    CodecParams::H264 {
+                        sps: Bytes::new(),
+                        pps: Bytes::new(),
+                    }
+                }
+            } else {
+                CodecParams::H264 {
+                    sps: Bytes::new(),
+                    pps: Bytes::new(),
+                }
+            }
         }
+
         _ => unreachable!(), // already handled above
     };
 
