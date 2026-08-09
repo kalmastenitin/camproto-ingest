@@ -927,7 +927,6 @@ impl RtspClient {
                 Ok(()) => break,
                 Err(e) => {
                     let secs = backoff(attempt);
-                    println!("disconnected: {} - retrying in {}s", e, secs);
                     tokio::time::sleep(Duration::from_secs(secs)).await;
                     self.cseq = 1;
                     attempt += 1;
@@ -961,7 +960,6 @@ impl RtspClient {
         let clean_url = strip_userinfo(&self.config.url);
 
         let mut stream = Self::connect(&addr).await?;
-        println!("connected to {}", addr);
 
         Self::do_options(&mut stream, &clean_url, &mut self.cseq).await?;
 
@@ -1001,22 +999,21 @@ impl RtspClient {
             .await
             {
                 Ok(()) => {
-                    println!("audio SETUP successful");
+                    eprintln!("DEBUG audio SETUP successful");
                 }
 
                 Err(e) => {
-                    eprintln!("audio SETUP failed: {} — continuing video-only", e);
+                    eprintln!("DEBUG audio SETUP failed: {} — continuing video-only", e);
                 }
             };
         }
 
-        println!("VIDEO SETUP OK session={}", session);
+        eprintln!("DEBUG VIDEO SETUP OK session={}", session);
 
         if sdp_info.audio.is_some() {
-            println!("AUDIO TRACK PRESENT");
+            eprintln!("DEBUG AUDIO TRACK PRESENT");
         }
 
-        println!("SENDING PLAY");
         let result = self
             .play_and_stream(
                 &mut stream,
@@ -1064,7 +1061,7 @@ impl RtspClient {
             auth,
         )
         .await?;
-        println!("streaming camera_id={}", self.config.camera_id);
+        DEBUG!("streaming camera_id={}", self.config.camera_id);
         Self::rtp_loop(stream, &self.config.camera_id, sdp_info, &self.tx).await
     }
 
