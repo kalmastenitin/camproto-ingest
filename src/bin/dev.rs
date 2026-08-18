@@ -3,8 +3,9 @@ use camproto_ingest::rtsp::{RtspClient, RtspConfig};
 #[tokio::main]
 async fn main() {
     let config = RtspConfig {
-        url: "rtsp://admin:password@192.168.1.241:554/Streaming/Unicast/channels/101".into(),
+        url: "rtsp://admin:sachin1997@192.168.1.241:554/Streaming/Unicast/channels/101".into(),
         camera_id: "cam_001".into(),
+        ..Default::default()
     };
 
     let (client, mut rx) = RtspClient::new(config);

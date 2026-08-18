@@ -15,9 +15,13 @@ use url::Url;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
+#[derive(Default)]
 pub struct RtspConfig {
     pub url: String,
     pub camera_id: String,
+    pub playback_start: Option<String>,
+    pub playback_end: Option<String>,
+    pub playback_scale: Option<f32>,
 }
 
 pub struct RtspClient {
@@ -387,11 +391,17 @@ impl RtspClient {
         username: &str,
         password: &str,
         auth_method: &Auth,
+        is_playback: bool,
     ) -> Result<String, BoxError> {
         let mut req = format!("SETUP {} RTSP/1.0\r\nCSeq: {}\r\n", setup_url, cseq);
         if let Some(auth) = auth_method.header("SETUP", setup_url, username, password) {
             req.push_str(&format!("Authorization: {}\r\n", auth));
         }
+
+        if is_playback {
+            req.push_str("Require: onvif-replay\r\n");
+        }
+
         req.push_str("Transport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n\r\n");
         *cseq += 1;
         stream.write_all(req.as_bytes()).await?;
@@ -419,13 +429,19 @@ impl RtspClient {
         password: &str,
         auth_method: &Auth,
         session: &str,
+        is_playback: bool,
     ) -> Result<(), BoxError> {
         let mut req = format!(
             "SETUP {} RTSP/1.0\r\nCSeq: {}\r\nSession: {}\r\n",
             audio_url, cseq, session
         );
+
         if let Some(auth) = auth_method.header("SETUP", audio_url, username, password) {
             req.push_str(&format!("Authorization: {}\r\n", auth));
+        }
+
+        if is_playback {
+            req.push_str("Require: onvif-replay\r\n");
         }
         req.push_str("Transport: RTP/AVP/TCP;unicast;interleaved=2-3\r\n\r\n");
         *cseq += 1;
@@ -447,22 +463,80 @@ impl RtspClient {
         username: &str,
         password: &str,
         auth_method: &Auth,
+        playback_start: Option<&str>,
+        playback_end: Option<&str>,
+        playback_scale: Option<f32>,
     ) -> Result<(), BoxError> {
+        let is_playback = playback_start.is_some();
+
         let mut req = format!(
             "PLAY {} RTSP/1.0\r\nCSeq: {}\r\nSession: {}\r\n",
             url, cseq, session
         );
+
         if let Some(auth) = auth_method.header("PLAY", url, username, password) {
             req.push_str(&format!("Authorization: {}\r\n", auth));
         }
-        req.push_str("Range: npt=0.000-\r\n\r\n");
+
+        if is_playback {
+            // Required ONVIF replay feature tag.
+            req.push_str("Require: onvif-replay\r\n");
+
+            match (playback_start, playback_end) {
+                (Some(start), Some(end)) => {
+                    let start = rtsp_clock(start);
+                    let end = rtsp_clock(end);
+
+                    req.push_str(&format!("Range: clock={start}-{end}\r\n"));
+                }
+
+                (Some(start), None) => {
+                    let start = rtsp_clock(start);
+
+                    req.push_str(&format!("Range: clock={start}-\r\n"));
+                }
+
+                _ => {}
+            }
+
+            // For now leave rate control enabled so the NVR sends approximately
+            // real-time playback. Absence of this header means "yes" per ONVIF.
+            //
+            // Later, for fast export/download:
+            // req.push_str("Rate-Control: no\r\n");
+        } else {
+            // Normal live stream.
+            req.push_str("Range: npt=0.000-\r\n");
+        }
+
+        if let Some(scale) = playback_scale {
+            if (scale - 1.0).abs() > f32::EPSILON {
+                req.push_str(&format!("Scale: {scale}\r\n"));
+            }
+        }
+
+        req.push_str("\r\n");
+
         *cseq += 1;
+
+        eprintln!(
+            "DEBUG PLAY request:\n{}",
+            req.lines()
+                .filter(|line| !line.starts_with("Authorization:"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+
         stream.write_all(req.as_bytes()).await?;
+
         let resp = read_response(stream).await?;
+
+        eprintln!("DEBUG PLAY response:\n{resp}");
+
         match parse_status(&resp) {
             Some(200) => Ok(()),
-            Some(s) => Err(format!("PLAY failed: {}", s).into()),
-            None => Err("PLAY: could not parse status".into()),
+            Some(status) => Err(format!("PLAY failed: status={status}\n{resp}").into()),
+            None => Err(format!("PLAY: could not parse status\n{resp}").into()),
         }
     }
 
@@ -607,15 +681,15 @@ impl RtspClient {
                 // VIDEO RTP
                 // =================================================
                 0 => {
-                    if pkt.len() < 12 {
+                    let Some(off) = rtp_payload_offset(&pkt) else {
                         continue;
-                    }
+                    };
 
                     let marker = (pkt[1] & 0x80) != 0;
 
                     let timestamp = u32::from_be_bytes([pkt[4], pkt[5], pkt[6], pkt[7]]);
 
-                    let payload = &pkt[12..];
+                    let payload = &pkt[off..];
 
                     if payload.is_empty() {
                         continue;
@@ -860,14 +934,11 @@ impl RtspClient {
                 // AUDIO RTP
                 // =================================================
                 2 => {
-                    if pkt.len() < 12 {
+                    let Some(off) = rtp_payload_offset(&pkt) else {
                         continue;
-                    }
-
+                    };
                     let timestamp = u32::from_be_bytes([pkt[4], pkt[5], pkt[6], pkt[7]]);
-
-                    let payload = &pkt[12..];
-
+                    let payload = &pkt[off..];
                     if payload.is_empty() {
                         continue;
                     }
@@ -926,7 +997,11 @@ impl RtspClient {
             match self.connect_and_stream().await {
                 Ok(()) => break,
                 Err(e) => {
+                    eprintln!("[RTSP {}] stream failed: {}", self.config.camera_id, e);
+
                     let secs = backoff(attempt);
+                    eprintln!("[RTSP {}] reconnecting in {}s", self.config.camera_id, secs);
+
                     tokio::time::sleep(Duration::from_secs(secs)).await;
                     self.cseq = 1;
                     attempt += 1;
@@ -949,6 +1024,7 @@ impl RtspClient {
             .decode_utf8()
             .map(|s| s.into_owned())
             .unwrap_or_default();
+        let is_playback = self.config.playback_start.is_some();
 
         // The RTSP request-line URI (and therefore the digest `uri=` value) must
         // NOT contain embedded credentials — only the Authorization header does.
@@ -982,6 +1058,7 @@ impl RtspClient {
             &username,
             &password,
             &auth,
+            is_playback,
         )
         .await?;
 
@@ -995,6 +1072,7 @@ impl RtspClient {
                 &password,
                 &auth,
                 &session,
+                is_playback,
             )
             .await
             {
@@ -1059,9 +1137,12 @@ impl RtspClient {
             username,
             password,
             auth,
+            self.config.playback_start.as_deref(),
+            self.config.playback_end.as_deref(),
+            self.config.playback_scale,
         )
         .await?;
-        DEBUG!("streaming camera_id={}", self.config.camera_id);
+        eprintln!("DEBUG streaming camera_id={}", self.config.camera_id);
         Self::rtp_loop(stream, &self.config.camera_id, sdp_info, &self.tx).await
     }
 
@@ -1117,4 +1198,26 @@ fn strip_userinfo(url: &str) -> String {
     out.push_str(&url[..after_scheme]);
     out.push_str(&url[after_scheme + at_pos + 1..]);
     out
+}
+
+fn rtsp_clock(value: &str) -> String {
+    value.trim().replace('-', "").replace(':', "")
+}
+
+fn rtp_payload_offset(pkt: &[u8]) -> Option<usize> {
+    if pkt.len() < 12 {
+        return None;
+    }
+    let cc = (pkt[0] & 0x0F) as usize; // CSRC count
+    let has_ext = (pkt[0] & 0x10) != 0; // X bit
+    let mut offset = 12 + cc * 4;
+    if has_ext {
+        // 2 bytes profile id, 2 bytes length (in 32-bit words), then the words.
+        if pkt.len() < offset + 4 {
+            return None;
+        }
+        let ext_words = u16::from_be_bytes([pkt[offset + 2], pkt[offset + 3]]) as usize;
+        offset += 4 + ext_words * 4;
+    }
+    (pkt.len() >= offset).then_some(offset)
 }
